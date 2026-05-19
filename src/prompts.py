@@ -190,8 +190,9 @@ def _check_post_implies_spec(block, post_condition, spec_post_condition, knowled
         event_id = new_event_id("llm")
         started = utc_now_iso()
         response = None
+        usage = {}
         try:
-            response = _retry_create(_openrouter_client, REASONER_SPEC_CHECK_MODEL, messages)
+            response, usage = _retry_create(_openrouter_client, REASONER_SPEC_CHECK_MODEL, messages)
         except Exception as exc:
             event = {
                 "event_id": event_id,
@@ -231,6 +232,7 @@ def _check_post_implies_spec(block, post_condition, spec_post_condition, knowled
                 "purpose": "check_post_implies_spec",
                 "model": REASONER_SPEC_CHECK_MODEL,
                 "attempt": attempt,
+                "usage": usage,
                 "parsed": {
                     "CHECK_START": check,
                     "STMT_START": stmts,
