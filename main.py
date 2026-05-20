@@ -106,7 +106,6 @@ def _get_pending_batches(batches, proj_dir):
     return pending
 
 
-
 def _has_source_code(proj_dir):
     """Check whether proj_dir contains at least one source code file."""
     source_exts = set(EXT_TO_LANG.keys())

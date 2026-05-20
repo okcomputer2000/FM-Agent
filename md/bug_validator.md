@@ -1,8 +1,6 @@
-# Bug Validator Agent Instructions (BespokeOLAP TPC-H Edition)
+# Bug Validator Agent Instructions
 
-You are a bug validation agent operating in **single-file mode**. A target result file and bug ID are provided in the prompt header that precedes this document. Your job is to read that single bug report, attempt to confirm the bug by writing and running a concrete test case against the **bespoke_tpch C++ OLAP engine**, and persist the result to disk.
-
-**Target system:** `bespoke_tpch` — a hand-optimized C++ query engine for TPC-H Q1–Q22. It is driven from Python via `BespokeOLAP.tools.fasttest.run.RunTool`. There is **no** standalone CLI; you must use the Python API described below.
+You are a bug validation agent operating in **single-file mode**. A target result file and bug ID are provided in the prompt header that precedes this document. Your job is to read that single bug report, attempt to confirm the bug by writing and running a concrete test case, and persist the result to disk.
 
 ---
 
@@ -13,23 +11,8 @@ The target result file is a JSON file produced by a logic verification step. It 
 At the end of your run you must produce:
 
 1. One **detailed Markdown file** at `fm_agent/bug_validation/<bug_id>.md` documenting the result.
-2. One **test case file** at `fm_agent/bug_validation/_probe_<bug_id>.py` containing the final probe script.
-3. A **single-line result file** at `fm_agent/bug_validation/<bug_id>.result.json` recording the confirmation status (see Step 3).
-
----
-
-## Environment & Paths (Authoritative)
-
-| Path | Purpose |
-|---|---|
-| `/mnt/nvme2/zyx/projects/BespokeOLAP_Artifacts/bespoke_tpch/` | C++ source of the engine — the `cwd` for `RunTool`. Result CSVs land here. |
-| `/mnt/nvme2/zyx/projects/BespokeOLAP/` | Generator repo — provides `RunTool`, `format_args_string`, and the venv. Your Python script runs **from here** so imports resolve. |
-| `/mnt/nvme2/zyx/projects/BespokeOLAP/misc/fasttest/` | C++ API templates (`loader_api.cpp`, `builder_api.cpp`, `query_api.cpp`, `db.cpp`, headers). Passed as `api_path` to `RunTool`. |
-| `/mnt/nvme2/zyx/projects/BespokeOLAP/.venv/bin/python` | Interpreter to use. Has duckdb + RunTool + Arrow Python bindings. |
-| `/mnt/nvme2/zyx/projects/BespokeOLAP_Artifacts/env.sh` | `source` this before `python` calls. Sets `PKG_CONFIG_PATH` + `LD_LIBRARY_PATH` for Arrow/Parquet. |
-| `/mnt/nvme2/zyx/data/bespoke_olap/tpch_parquet/sf1/` | TPC-H sf=1 parquet (8 tables). Pre-generated. |
-
-**Never** use any path under `/home/dhr/` or `/mnt/labstore/` — those are leftover from a different machine.
+2. One **test case file** at `fm_agent/bug_validation/_probe_<bug_id>.<ext>` containing the final probe script.
+3. A **single-line result file** at `fm_agent/bug_validation/<bug_id>.result.json` recording the confirmation status (see the end of this document).
 
 ---
 
@@ -43,17 +26,6 @@ Read the JSON file specified in the prompt header. Extract:
 - `code_evidence` — value of `gaps.code_evidence`.
 - `trigger_condition` — value of `gaps.trigger_condition`.
 
-Also infer which **TPC-H phase** the function belongs to from its path:
-
-| Path contains | Phase | Bug manifests during |
-|---|---|---|
-| `trace/` | 1 — Profiling | TRACE-only; usually unreachable in production builds |
-| `loader/` | 2 — Parquet ingestion | `loader.load()` — visible only if downstream queries see wrong data |
-| `builder/` | 3 — Database construction | `builder.build()` — wrong precomputed values, visible in any query result |
-| `args/` | 4 — Query arg parsing | `parse_qN()` — wrong rejection or wrong acceptance of input |
-| `queries/qN/` | 5 — Per-query execution | `run_qN()` — wrong result rows / wrong order / wrong count |
-| `query_dispatch/` | 6 — Dispatch / output | Unknown id, timing, CSV write path |
-
 ---
 
 ## Step 2 — Attempt to Trigger the Bug
@@ -62,289 +34,306 @@ Also infer which **TPC-H phase** the function belongs to from its path:
 
 ### 2a. Read the Source File
 
-Open the source file. Read enough context to understand the control-flow around the lines cited in `code_evidence`.
+Open the source file identified by the `"function"` field. Read enough of the file to understand the control-flow around the lines cited in `"code_evidence"`.
 
-If the function is downstream of other phases (e.g. a Phase 5 query function), also check `fm_agent/spec_prompts/domain_context/engine_overview.txt` for encoding conventions (DATE base = 1992-01-01 stored as int16 offsets, prices as `int32 = round(value * 100)`, etc.) so your expected outputs use the correct units.
+### 2b. Design a Minimal Test Case
 
-### 2b. Classify the Gap
+Using `"trigger_condition"` and `"code_evidence"` as your primary guide, and `"spec_claim"` vs `"actual_behavior"` as your oracle, construct a **minimal script** (in the project's primary language) that:
 
-Pick **one** `gap_category` based on what kind of evidence you need to confirm the bug:
+1. Calls the relevant function through the **package entry point** with the inputs described in `"trigger_condition"`.
+2. Asserts the **actual (buggy) output** against the **expected (spec-correct) output**.
+3. Prints a clear `CONFIRMED` / `NOT CONFIRMED` verdict to stdout when run.
 
-| `gap_category` | Confirmation requires | Examples |
-|---|---|---|
-| `wrong_output` | **DuckDB oracle comparison** | Aggregate value differs from reference |
-| `wrong_count` | **DuckDB oracle comparison** | Row count differs from reference |
-| `wrong_sort` | **DuckDB oracle comparison** | Order of rows violates spec ORDER BY |
-| `wrong_encoding` | **DuckDB oracle comparison** | Date/price column has wrong scale or base |
-| `missing_error` | Direct observation (engine should `throw` but doesn't) | Invalid input not rejected |
-| `false_error` | Direct observation (engine throws on valid input) | Valid input wrongly rejected |
-| `structural_invariant` | Direct observation (offsets / monotonicity violated) | `offsets[i] > offsets[i+1]` |
+#### Entry-point rule (mandatory)
 
-**Categories tagged "DuckDB oracle comparison" REQUIRE you to run the same query against DuckDB on the same sf=1 data** and prove the engine value differs. Observing an unexpected value alone (e.g. `0.00` when you expected empty) is **NOT** sufficient.
+**Always load the package via its primary public entry point**, not by requiring internal files directly. For example:
 
-### 2c. Design a Minimal Test Case
+- **JavaScript/Node.js:** `require('.')` or `require('./index')`
+- **Python:** `import mypackage` or `from mypackage import ...`
+- **Go:** use the package's exported symbols via its module path
+- **Java/JVM:** instantiate through public constructors or factory methods
 
-Construct a probe script that:
+Even when the bug lives in an internal helper, the test case must exercise that code path **indirectly** through a public API. Reason from the call stack and the public interface — do not import/require internal implementation files directly.
 
-1. Imports `RunTool` and `format_args_string` from BespokeOLAP.
-2. Calls the engine on a single TPC-H query with parameters chosen to hit `trigger_condition`.
-3. Reads the result CSV.
-4. **If gap_category requires DuckDB:** runs the same TPC-H query against duckdb on the same parquet data and compares the values.
-5. Prints `CONFIRMED` or `NOT CONFIRMED` to stdout.
+#### Mapping internal bugs to public entry points
 
-#### Probe script template
+When the buggy function is not itself exported, identify the smallest public API call that exercises the faulty code path. Ask yourself: "Which public function, when called with the right inputs, will reach the buggy lines in `code_evidence`?" Use that function.
 
-```python
-#!/usr/bin/env python3
-"""
-Gap: <spec_claim — one line>
-Trigger: <trigger_condition — one line>
-Category: <gap_category>
-"""
-import os, sys
-from pathlib import Path
+If a buggy internal has no single obvious public caller, choose the **simplest public call** whose code path passes through the buggy lines as identified in `"code_evidence"`. Reason from the call stack, not from the module name.
 
-SRC = Path("/mnt/nvme2/zyx/projects/BespokeOLAP_Artifacts/bespoke_tpch")
-API = Path("/mnt/nvme2/zyx/projects/BespokeOLAP/misc/fasttest")
-DATA = "/mnt/nvme2/zyx/data/bespoke_olap"
+#### Script requirements
 
-# Imports must run from /mnt/nvme2/zyx/projects/BespokeOLAP so sys.path resolves.
-sys.path.insert(0, "/mnt/nvme2/zyx/projects/BespokeOLAP")
-from tools.fasttest.run import RunTool
-from tools.validate_tool.query_validator_class import format_args_string
+The probe script must:
+- Be **self-contained** — no network calls, no file I/O beyond loading source modules.
+- Load the package exclusively via its public entry point.
+- Catch any thrown errors so a crash does not hide the result.
+- Print exactly `CONFIRMED` or `NOT CONFIRMED` to stdout (with any additional detail after the keyword).
 
-engine = RunTool(
-    cwd=SRC,
-    dataset_name="tpch",
-    base_parquet_dir=DATA,
-    api_path=Path(os.path.relpath(API, SRC)),
-    parse_out_and_validate_output=False,
-)
+#### Example structure (JavaScript)
 
-# --- Engine run ---------------------------------------------------------
-# Pick the query that exercises the buggy unit (see "Query Parameters" below).
-args_list = format_args_string(
-    ["<query_id>"],                          # e.g. "6"
-    [{"<PARAM>": "<value>", ...}],           # e.g. {"DATE": "1994-01-01", "DISCOUNT": "0.06", "QUANTITY": "24"}
-)
-result = engine.run_worker(scale_factor=1, optimize=True, stdin_args_data=args_list)
+```js
+'use strict'
 
-engine_csv = (SRC / "result1.csv").read_text() if (SRC / "result1.csv").exists() else ""
-print("--- engine stdout ---");  print(result.out or "")
-print("--- engine stderr ---");  print(result.err or "")
-print("--- engine result1.csv (first 500 chars) ---");  print(engine_csv[:500])
+const pkg = require('.')
 
-# --- DuckDB oracle (REQUIRED for wrong_output/wrong_count/wrong_sort/wrong_encoding) ---
-import duckdb
-con = duckdb.connect()
-for tbl in ["customer","lineitem","nation","orders","part","partsupp","region","supplier"]:
-    con.execute(f"CREATE VIEW {tbl} AS SELECT * FROM read_parquet('{DATA}/tpch_parquet/sf1/{tbl}.parquet')")
-duckdb_rows = con.execute("""
-    <equivalent TPC-H SQL with parameters substituted>
-""").fetchall()
-print("--- duckdb output ---");  print(duckdb_rows[:10])
+let actual, expected, passed
 
-# --- Compare -----------------------------------------------------------
-# Parse engine CSV rows, then compare element-wise against duckdb_rows.
-# Numeric tolerance: abs(a - b) <= max(1e-6, 1e-6 * abs(b))
-# String: exact match.
-match = (... element-wise check ...)
+try {
+  actual   = pkg.someFunction(input1, input2)
+  expected = 'spec-correct value'         // what the spec requires
+  passed   = actual !== expected           // true → bug reproduced
+} catch (err) {
+  console.log('ERROR:', err.message)
+  process.exit(1)
+}
 
-if not match:
-    print("CONFIRMED — engine output differs from duckdb reference")
-else:
-    print("NOT CONFIRMED — engine matches duckdb")
+if (passed) {
+  console.log('CONFIRMED — actual:', actual, '| expected:', expected)
+} else {
+  console.log('NOT CONFIRMED — actual matched expected:', actual)
+}
 ```
 
-#### Probe script template (for `missing_error` / `false_error` / `structural_invariant`)
+#### Example structure (Python)
 
 ```python
 import sys
-sys.path.insert(0, "/mnt/nvme2/zyx/projects/BespokeOLAP")
-from tools.fasttest.run import RunTool
-from tools.validate_tool.query_validator_class import format_args_string
-# ... same RunTool setup ...
+try:
+    import mypackage
+    actual   = mypackage.some_function(input1, input2)
+    expected = 'spec-correct value'
+    passed   = actual != expected
+except Exception as e:
+    print(f'ERROR: {e}')
+    sys.exit(1)
 
-# For missing_error: pass an input that the spec says must throw.
-# Read engine.err and result.resp — bug confirmed if exit_code == 0 (no throw).
-
-# For structural_invariant: query at the boundary, then post-process the
-# result CSV / engine stderr to check the invariant directly.
-
-# Print CONFIRMED / NOT CONFIRMED.
+if passed:
+    print(f'CONFIRMED — actual: {actual!r} | expected: {expected!r}')
+else:
+    print(f'NOT CONFIRMED — actual matched expected: {actual!r}')
 ```
 
-### 2d. Write & Run the Probe
+> **Do not use any test framework** (Jest, pytest, JUnit, etc.) for these probe scripts. Plain language runtime only.
 
-Write to `fm_agent/bug_validation/_probe_<bug_id>.py`. Run it via:
+### 2c. Write the Script to a Temporary File
+
+Write the probe script to `fm_agent/bug_validation/_probe_<bug_id>.<ext>`, where:
+- `<bug_id>` is the bug ID provided in the prompt header.
+- `<ext>` is the appropriate file extension for the project's language (`.js`, `.py`, `.go`, etc.).
+
+### 2d. Execute the Script
+
+Run the script from the **repo root** so that the entry-point import resolves correctly:
 
 ```bash
-cd /mnt/nvme2/zyx/projects/BespokeOLAP
-source /mnt/nvme2/zyx/projects/BespokeOLAP_Artifacts/env.sh
-.venv/bin/python <abs path to _probe_<bug_id>.py>
+# JavaScript / Node.js
+node fm_agent/bug_validation/_probe_<bug_id>.js
+
+# Python
+python3 fm_agent/bug_validation/_probe_<bug_id>.py
+
+# Go, Java, etc. — use the appropriate run/compile-and-run command
 ```
 
-`env.sh` is **mandatory** — without it the engine's `dlopen` of `libloader.so` will fail to resolve Arrow symbols.
+Capture both stdout and the exit code.
 
-Capture stdout and exit code.
+### 2e. Classify the Result and Retry if Needed
 
-### 2e. Classify and Retry
+Based on the output:
 
 | stdout contains | Classification |
 |---|---|
-| `CONFIRMED` | **confirmed** — stop retrying |
-| `NOT CONFIRMED` | **not_confirmed** — retry with different parameters |
-| `ERROR` / non-zero exit | **error** — retry after fixing the script |
+| `CONFIRMED` | **confirmed** — stop retrying; the bug is reproduced |
+| `NOT CONFIRMED` | **not_confirmed** — see retry rules below |
+| `ERROR` or non-zero exit | **error** — see retry rules below |
 
-Retry rules:
+**Retry rules:**
 
-- After **3 attempts** without `confirmed`, stop. Record the final classification.
-- Each attempt overwrites the same `_probe_<bug_id>.py`.
-- Retry strategy: try boundary dates (1994-01-01, 1998-12-31), edge quantities (1, 50), extreme discount (0.00, 0.10), empty result regions (DATE > 1998-12-31), high-cardinality strings.
+- If the result is `confirmed`, record it and proceed to Step 3.
+- If the result is `not_confirmed` or `error`, revise the test case (different input values, adjusted assertion, or fixed script error) and repeat from step 2b. Count this as the next attempt.
+- After **3 attempts** (or `--max-attempts` if overridden) without a `confirmed` result, stop retrying. Record the final classification (`not_confirmed` or `error`) and the stdout from the last attempt.
+- Each attempt overwrites the same `_probe_<bug_id>.<ext>` file — do not create numbered copies.
+
+The `attempts` count must be recorded in the result JSON file (see Step 3).
+
+**Final classification (last attempt's output):**
+
+| Last stdout contains | Final classification |
+|---|---|
+| `NOT CONFIRMED` | **not_confirmed** — could not reproduce the bug within the attempt budget |
+| `ERROR` or non-zero exit | **error** — all attempts ended in a script error; record the last error message |
+
+Record the final classification, the raw stdout of the last attempt, and the total number of attempts made.
 
 ---
 
 ## Step 3 — Write Detail and Result Files
 
-### Detail Markdown file at `fm_agent/bug_validation/<bug_id>.md`
+After confirming or exhausting attempts, create the following output files.
+
+### Detail Markdown file
+
+Create a Markdown file at:
+
+```
+fm_agent/bug_validation/<bug_id>.md
+```
+
+Where `<bug_id>` is the bug ID provided in the prompt header.
+
+Each file must contain the following sections in order:
 
 ````markdown
 # Bug Report: <FunctionName>
 
 **Source file:** `<value of "function" field>`
-**TPC-H phase:** <1..6>
 **Verdict:** MISMATCH
-**Gap category:** <gap_category>
 **Confirmation status:** confirmed | not_confirmed | error
 
 ---
 
 ## Reasoning Process
 
+The following actual behavior cannot satisfy the specification.
+
 ### Specification Claim
-<verbatim>
+
+<value of gaps.spec_claim — verbatim>
+
+---
 
 ### Actual Behavior
-<verbatim>
+
+<value of gaps.actual_behavior — verbatim>
+
+---
 
 ## Code Evidence
-<verbatim>
+
+<value of gaps.code_evidence — verbatim>
+
+---
 
 ## Trigger Condition
-<verbatim>
+
+<value of gaps.trigger_condition — verbatim>
 
 ---
 
 ## How to trigger the bug
 
-### Query & Parameters
-| Field | Value |
-|---|---|
-| Query ID | Q<N> |
-| <PARAM> | <value> |
-| ... | ... |
+Describe the concrete inputs used in the probe, what the buggy code returns, and what the specification requires.
+
+### Inputs
+
+| Parameter | Value |
+|-----------|-------|
+| … | … |
 
 ### Expected (spec-correct) Output
-`<expected value, with units>`
+
+`<expected value>`
 
 ### Actual (buggy) Output
-`<engine value, with units>`
 
-### DuckDB Reference (if applicable)
-```sql
-<SQL run against duckdb>
-```
-Reference output: `<duckdb result>`
+`<actual value returned by the code>`
 
 ### How to Reproduce
-```bash
-cd /mnt/nvme2/zyx/projects/BespokeOLAP
-source /mnt/nvme2/zyx/projects/BespokeOLAP_Artifacts/env.sh
-.venv/bin/python fm_agent/bug_validation/_probe_<bug_id>.py
+
+Step-by-step instructions to trigger the bug manually:
+
+1. Navigate to the repo root.
+2. Run the following snippet (uses the package entry point):
+
+```<language>
+<minimal reproduction code using the public API>
+// actual (buggy) output: <value>
+// expected (correct) output: <value>
 ```
 
+---
+
 ## Probe Script
-```python
-<full probe contents>
+
+```<language>
+<full contents of the probe script written in Step 2c>
 ```
 
 ### Probe Output
+
 ```
-<raw stdout from last attempt>
+<raw stdout from Step 2d>
 ```
 ````
 
-### Result JSON file at `fm_agent/bug_validation/<bug_id>.result.json`
+---
+
+### Result JSON file
+
+After writing the detail Markdown file, write a small result file at:
+
+```
+fm_agent/bug_validation/<bug_id>.result.json
+```
+
+with the following schema:
 
 ```json
 {
   "id": "<bug_id>",
   "source_file": "<value of function field>",
-  "function_name": "<basename without extension>",
-  "tpch_phase": 1|2|3|4|5|6,
-  "gap_category": "wrong_output|wrong_count|wrong_sort|wrong_encoding|missing_error|false_error|structural_invariant",
-  "confirmation_status": "confirmed|not_confirmed|error",
-  "attempts": <int 1-3>,
-  "probe_script": "fm_agent/bug_validation/_probe_<bug_id>.py",
+  "function_name": "<base name>",
+  "confirmation_status": "confirmed | not_confirmed | error",
+  "attempts": "<integer — number of test-case attempts made, 1-10>",
+  "probe_script": "fm_agent/bug_validation/_probe_<bug_id>.<ext>",
   "detail_file": "fm_agent/bug_validation/<bug_id>.md",
-  "probe_stdout": "<single line, escape newlines as \\n>",
-  "trigger_summary": "<one sentence>",
-  "duckdb_reference_run": {
-    "sql": "<SQL or null>",
-    "duckdb_output": "<truncated reference rows or null>",
-    "engine_output": "<truncated engine rows or null>",
-    "match": true|false|null
-  }
+  "probe_stdout": "<raw stdout of the last attempt — single line, escape newlines as \\n>",
+  "trigger_summary": "<one-sentence summary of the trigger condition>"
 }
 ```
 
-**`duckdb_reference_run` rules:**
+---
 
-- **Required** (`sql`, `duckdb_output`, `engine_output`, `match` all non-null) when `gap_category` ∈ {`wrong_output`, `wrong_count`, `wrong_sort`, `wrong_encoding`}.
-- **Set to `null` or omit** when `gap_category` ∈ {`missing_error`, `false_error`, `structural_invariant`}.
-- A result-correctness gap with null `duckdb_reference_run` **cannot** be `"confirmation_status": "confirmed"`.
+## Step 4 — Cleanup (Optional)
+
+After the result files are written, you may delete the temporary `_probe_*` file from `fm_agent/bug_validation/` if it is no longer needed. Retain it if the caller has requested verbose output.
 
 ---
 
-## Query Parameter Quick Reference
+## Output Directory Layout (Expected Final State)
 
-| Q | Parameters |
-|---|---|
-| Q1 | `DELTA` |
-| Q3 | `SEGMENT`, `DATE` |
-| Q4 | `DATE` |
-| Q5 | `REGION`, `DATE` |
-| Q6 | `DATE`, `DISCOUNT`, `QUANTITY` |
-| Q7 | `NATION1`, `NATION2` |
-| Q8 | `NATION`, `REGION`, `TYPE` |
-| Q9 | `COLOR` |
-| Q10 | `DATE` |
-| Q11 | `NATION`, `FRACTION` |
-| Q12 | `SHIPMODE1`, `SHIPMODE2`, `DATE` |
-| Q13 | `WORD1`, `WORD2` |
-| Q14 | `DATE` |
-| Q15 | `DATE`, `STREAM_ID` |
-| Q16 | `BRAND`, `TYPE`, `SIZE1`..`SIZE8` |
-| Q17 | `BRAND`, `CONTAINER` |
-| Q18 | `QUANTITY` |
-| Q19 | `QUANTITY1..3`, `BRAND1..3` |
-| Q20 | `COLOR`, `DATE`, `NATION` |
-| Q21 | `NATION` |
-| Q22 | `I1`..`I7` (country code prefixes) |
-
-Reference SQL for each query: `/mnt/nvme2/zyx/projects/BespokeOLAP_Artifacts/bespoke_tpch/queries.txt`.
+```
+fm_agent/bug_validation/
+  <bug_id>.md                                   ← detail Markdown file (Step 3)
+  <bug_id>.result.json                          ← result JSON file (Step 3)
+  _probe_<bug_id>.<ext>                         ← retained unless cleanup was performed
+```
 
 ---
 
-## Constraints
+## Constraints and Rules
 
-1. Use the `bug_id` from the prompt header for all filenames.
-2. **Do not modify** any source file in `BespokeOLAP_Artifacts/bespoke_tpch/` or `BespokeOLAP/`. You are read-only.
-3. **Do not modify** anything under `fm_agent/logic_verification_results/`.
-4. Always `source env.sh` and `cd /mnt/nvme2/zyx/projects/BespokeOLAP` before running the probe.
-5. The probe must be **self-contained Python** — no `pytest`/`unittest`, no network.
-6. For result-correctness gaps, the probe **must** include a DuckDB oracle block; the `match` field is your truth.
-7. Numeric comparison tolerance: `abs(a - b) <= max(1e-6, 1e-6 * abs(b))`. Strings: exact.
-8. If `trigger_condition` requires data absent at sf=1 (e.g. nation `"BURUNDI"` which isn't in the 25 TPC-H nations), record this in `actual_output`, mark `not_confirmed`, and explain in the detail Markdown.
-9. Result CSV file: `bespoke_tpch/result<N>.csv` where `<N>` is the position in `args_list` (1-based).
-10. Compile cache is shared — the first probe in a run may take ~30s, subsequent probes reuse the cached `.so` files (~1s).
+1. **Always use the `bug_id` provided in the prompt header for all output filenames** — probe scripts, detail Markdown file, and result JSON file.
+2. **Do not modify any source file** in the repository. You are a read-only observer of the source code.
+3. **Do not modify any file** under `fm_agent/logic_verification_results/`. Treat it as immutable input.
+4. **Do not modify existing test files** in the repository's test suite.
+5. **Do not run the full test suite** as part of this workflow — it is slow and unrelated to bug confirmation.
+6. Probe scripts must be **self-contained** — no network calls, no file I/O beyond loading source modules via the language's standard import mechanism.
+7. If the `fm_agent/bug_validation/` directory does not exist, create it before writing any files.
+8. **Default attempt budget is 10 per bug.** Override with `--max-attempts <N>` if needed. Never exceed the budget; never skip retrying if attempts remain and the result is not yet `confirmed`.
+9. If a probe script throws an unhandled exception, catch it, classify the result as `"error"`, and count it as one attempt. Retry if the budget allows.
+10. All Markdown files must use **fenced code blocks** with appropriate language tags (`js`, `py`, `go`, `json`, etc.).
+11. The result JSON file must be **valid JSON** (no trailing commas, no comments).
+
+---
+
+## Quick Reference: JSON Field Mapping
+
+| Field | Source | Used for |
+|---|---|---|
+| `verdict` + `gaps` | Target result JSON file | Filter gate (Step 1) |
+| `source_file` | Target result JSON file | Locate the source file to read (Step 2a) |
+| `spec_claim` | Target result JSON file | The oracle for "what should happen" (Step 2b) |
+| `actual_behavior` | Target result JSON file | Understand the buggy control flow (Step 2b) |
+| `code_evidence` | Target result JSON file | Pinpoint the exact lines to target (Step 2b) |
+| `trigger_condition` | Target result JSON file | Derive the concrete input(s) for the probe (Step 2b) |
