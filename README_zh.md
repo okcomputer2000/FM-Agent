@@ -53,15 +53,18 @@ FM-Agent 的[官方网站](http://fm-agent.ai/)提供了在线代码库推理服
 - [OpenCode](https://github.com/opencode-ai/opencode) 1.4.6
 - [Bun](https://bun.sh/)
 - [oh-my-openagent](https://www.npmjs.com/package/oh-my-openagent) 插件（通过 `bunx` 安装）
-- [OpenRouter](https://openrouter.ai/) API 密钥
+- [@lucentia/opencode-trace](https://www.npmjs.com/package/@lucentia/opencode-trace) 插件 —— 采集 OpenCode 原始 LLM 请求/响应 trace
+- 你所用 provider 的 LLM API 密钥（示例使用 [OpenRouter](https://openrouter.ai/)）
 
 ### 安装依赖
 
-将 [OpenRouter](https://openrouter.ai/) API 密钥设置为环境变量。注意，FM-Agent 目前仅支持 OpenRouter API 密钥，因为它需要并发调用 LLM。OpenRouter 的 RPM（每分钟请求数）和 TPM（每分钟 Token 数）限制更宽松。
+设置 FM-Agent 和 OpenCode 共用的 LLM API 密钥。推荐使用 [OpenRouter](https://openrouter.ai/)：FM-Agent 会并发调用 LLM，而 OpenRouter 的 RPM（每分钟请求数）和 TPM（每分钟 Token 数）限制更宽松——不过任何兼容的 provider 都可以。
 
 ```bash
-export OPENROUTER_API_KEY="your-api-key-here"
+export LLM_API_KEY="your-api-key-here"
 ```
+
+OpenCode provider 的配置以及可选的 prompt 缓存设置见 [docs/config_llm.md](docs/config_llm.md)。
 
 上述所有依赖（Ubuntu 和 Python 除外）均可通过以下脚本一键安装：
 
@@ -85,8 +88,8 @@ export OPENROUTER_API_KEY="your-api-key-here"
 | `OPENCODE_BUG_VALIDATION_MODEL` | `LLM_MODEL` | 用于进行 Bug 分析和生成报告的模型 |
 | `REASONER_POST_CONDITION_MODEL` | `LLM_MODEL` | 用于生成代码后置条件的模型 |
 | `REASONER_SPEC_CHECK_MODEL` | `LLM_MODEL` | 用于检查代码后置条件是否违反规约的模型 |
-| `LLM_OPENROUTER_API_KEY` | （环境变量） | OpenRouter API 密钥（通过 `os.environ.get("OPENROUTER_API_KEY")` 读取） |
-| `LLM_OPENROUTER_API_BASE_URL` | `https://openrouter.ai/api/v1` | OpenRouter API 基础 URL |
+| `LLM_API_KEY` | （环境变量） | FM-Agent 直接调用 LLM 使用的 API 密钥 |
+| `LLM_API_BASE_URL` | `https://openrouter.ai/api/v1` | FM-Agent 直接调用 LLM 使用的 API 基础 URL |
 
 **重要说明：** 强烈建议使用 Claude Sonnet 4.6 等能力较强的模型，其他模型可能推理能力，无法有效发现 Bug。此外，请使用有权限访问 Claude 模型的 API 密钥，因为 FM-Agent 调用的 OpenCode 可能会使用 Claude 模型。
 

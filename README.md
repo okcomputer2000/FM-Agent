@@ -53,16 +53,18 @@ The [website](http://fm-agent.ai/) of FM-Agent provides an online service for re
 - [OpenCode](https://github.com/opencode-ai/opencode) 1.4.6
 - [Bun](https://bun.sh/)
 - [oh-my-openagent](https://www.npmjs.com/package/oh-my-openagent) plugin (installed via `bunx`)
-- [OpenRouter](https://openrouter.ai/) API key
+- [@lucentia/opencode-trace](https://www.npmjs.com/package/@lucentia/opencode-trace) plugin — captures raw OpenCode LLM request/response traces (see [Structured Trace](#structured-trace))
+- An LLM API key for your provider (the examples use [OpenRouter](https://openrouter.ai/))
 
 ### Install Dependencies
 
-Set your [OpenRouter](https://openrouter.ai/) API key as an environment variable. Note that FM-Agent only supports the OpenRouter API key for now, because it will concurrently invoke LLMs. OpenRouter is flexible in RPM (requests per minute) and TPM (tokens per minute).
-
+Set the LLM API key used by both FM-Agent and OpenCode. We recommend [OpenRouter](https://openrouter.ai/): FM-Agent invokes LLMs concurrently, and OpenRouter is generous on RPM (requests per minute) and TPM (tokens per minute) — but any compatible provider works.
 
 ```bash
-export OPENROUTER_API_KEY="your-api-key-here"
+export LLM_API_KEY="your-api-key-here"
 ```
+
+See [docs/config_llm.md](docs/config_llm.md) for OpenCode provider configuration and optional prompt-cache setup.
 
 Then, all of the above dependencies (except Ubuntu and Python) can be installed via the provided script:
 
@@ -87,8 +89,8 @@ Key parameters can be adjusted in [config.py](config.py).
 | `REASONER_POST_CONDITION_MODEL` | `LLM_MODEL`                    | Model used by direct llm calls to generate block post-conditions |
 | `REASONER_SPEC_CHECK_MODEL`     | `LLM_MODEL`                    | Model used by direct llm calls to check whether actual post-conditions violate specs |
 | `OPENCODE_MODEL_PROVIDER`       | `openrouter`                   | OpenCode provider prefix used when invoking `opencode run --model <prefix>/<model>` |
-| `LLM_OPENROUTER_API_KEY`        | (env)                          | OpenRouter API key (read via `os.environ.get("OPENROUTER_API_KEY")`) |
-| `LLM_OPENROUTER_API_BASE_URL`   | `https://openrouter.ai/api/v1` | OpenRouter API base URL                                      |
+| `LLM_API_KEY`                   | (env)                          | LLM API key for FM-Agent's direct calls |
+| `LLM_API_BASE_URL`              | `https://openrouter.ai/api/v1` | LLM API base URL for FM-Agent's direct calls |
 
 (Optional) FM-Agent uses oh-my-openagent plugin to enhance OpenCode. The comment-checker hook built into this plugin should be disabled, otherwise it may intercept every comment block that FM-Agent writes, which are specifications of functions. It may force the agent to waste tokens justifying or removing them.
 You can open your oh-my-openagent config file (typically ~/.config/opencode/oh-my-openagent.json) and add disabled_hooks:

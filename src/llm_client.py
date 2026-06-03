@@ -14,7 +14,7 @@ from .trace_writer import (
     utc_now_iso,
 )
 
-_openrouter_client = OpenAI(api_key=LLM_OPENROUTER_API_KEY, base_url=LLM_OPENROUTER_API_BASE_URL)
+_openrouter_client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_API_BASE_URL)
 
 _MAX_RATE_LIMIT_RETRIES = 20
 _MAX_LLM_RETRIES = 5
@@ -40,7 +40,7 @@ def _stable_user_id():
     if override:
         return override
     # Derive from API key so multi-tenant deployments don't collide.
-    key = LLM_OPENROUTER_API_KEY or "no-key"
+    key = LLM_API_KEY or "no-key"
     return "fm-agent-" + hashlib.sha256(key.encode()).hexdigest()[:12]
 
 
@@ -89,12 +89,12 @@ def _anthropic_create(model, messages):
         "metadata": {"user_id": _stable_user_id()},
     }
 
-    url = LLM_OPENROUTER_API_BASE_URL.rstrip("/") + "/messages"
+    url = LLM_API_BASE_URL.rstrip("/") + "/messages"
     req = urllib.request.Request(
         url,
         data=json.dumps(body).encode("utf-8"),
         headers={
-            "Authorization": f"Bearer {LLM_OPENROUTER_API_KEY}",
+            "Authorization": f"Bearer {LLM_API_KEY}",
             "Content-Type": "application/json",
             "anthropic-version": "2023-06-01",
         },

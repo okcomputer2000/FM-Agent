@@ -3,8 +3,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-LLM_OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-LLM_OPENROUTER_API_BASE_URL = os.environ.get("LLM_API_BASE_URL", "https://openrouter.ai/api/v1")
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
+LLM_API_BASE_URL = os.environ.get("LLM_API_BASE_URL", "https://openrouter.ai/api/v1")
 LLM_MODEL = os.environ.get("LLM_MODEL", "anthropic/claude-sonnet-4.6")
 # OpenCode provider prefix used when invoking `opencode run --model <prefix>/<model>`.
 # Must match a provider registered in ~/.config/opencode/opencode.json.
