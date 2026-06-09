@@ -7,7 +7,7 @@ from config import (
 )
 from src.file_utils import collect_file_names, is_file_ready
 from src.verification import streaming_reasoner
-from src.extract import run_extraction, EXT_TO_LANG
+from src.extract import run_extraction, EXT_TO_LANG, _is_test_file
 from src.generate_topdown_layers import generate_topdown_layers
 from src.opencode_trace import (
     finish_opencode_trace,
@@ -24,6 +24,22 @@ import time
 import shutil
 import subprocess
 import logging
+import tempfile
+import contextlib
+
+def _merge_descriptions(target_desc, source_desc):
+    """Append a removed module's description to the owning module's description.
+
+    Avoids re-merging the same content if it is already present.
+    """
+    source_desc = (source_desc or "").strip()
+    if not source_desc:
+        return target_desc
+    if source_desc in target_desc:
+        return target_desc
+    if not target_desc:
+        return source_desc
+    return f"{target_desc}\n\n{source_desc}"
 
 def _deduplicate_phases(phases_dir):
     """Ensure each source file appears in at most one phase; keep the earliest."""
@@ -32,14 +48,18 @@ def _deduplicate_phases(phases_dir):
         data = json.load(f)
 
     seen = set()
+    # Maps each kept source file to the module that first claimed (owns) it.
+    file_owner = {}
     phases_to_remove = []
     for phase in sorted(data["phases"], key=lambda p: p["phase"]):
+        modules_to_remove = []
         for module in phase["modules"]:
             original = module["source_files"]
             deduped = []
             for sf in original:
                 if sf not in seen:
                     seen.add(sf)
+                    file_owner[sf] = module
                     deduped.append(sf)
                 else:
                     logging.info(
@@ -47,6 +67,27 @@ def _deduplicate_phases(phases_dir):
                         sf, phase["phase"], module["name"],
                     )
             module["source_files"] = deduped
+            if not deduped:
+                # Module lost all its files to deduplication. Merge its description
+                # into the owning modules that now hold those same files, then drop it.
+                owners = []
+                for sf in original:
+                    owner = file_owner.get(sf)
+                    if owner is not None and owner is not module and owner not in owners:
+                        owners.append(owner)
+                for owner in owners:
+                    owner["description"] = _merge_descriptions(
+                        owner.get("description", ""),
+                        module.get("description", ""),
+                    )
+                logging.info(
+                    "Removing empty module '%s' from phase %d; merged its description into %d module(s): %s",
+                    module.get("name", ""), phase["phase"], len(owners),
+                    ", ".join(o.get("name", "") for o in owners),
+                )
+                modules_to_remove.append(module)
+        for module in modules_to_remove:
+            phase["modules"].remove(module)
         total_files = sum(len(m["source_files"]) for m in phase["modules"])
         if total_files == 0:
             logging.info("Removing phase %d: no source files remain after deduplication", phase["phase"])
@@ -122,6 +163,44 @@ def _has_source_code(proj_dir):
     return False
 
 
+def _collect_project_source_files(proj_dir):
+    """Return non-test source files currently present in proj_dir, relative to proj_dir."""
+    source_exts = set(EXT_TO_LANG.keys())
+    files = set()
+    for root, dirs, names in os.walk(proj_dir):
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in
+                   {'node_modules', '__pycache__', 'venv', '.venv', 'fm_agent'}]
+        for fname in names:
+            ext = fname.rsplit('.', 1)[-1] if '.' in fname else ''
+            if ext not in source_exts:
+                continue
+            rel = os.path.relpath(os.path.join(root, fname), proj_dir).replace(os.sep, '/')
+            if not _is_test_file(rel):
+                files.add(rel)
+    return files
+
+
+def _phases_cover_current_sources(phases_json, proj_dir):
+    """Return whether phases.json is valid for the current source-file set."""
+    try:
+        with open(phases_json, "r") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return False
+
+    listed = set()
+    for phase in data.get("phases", []):
+        for module in phase.get("modules", []):
+            for source_file in module.get("source_files", []):
+                listed.add(source_file.replace("\\", "/"))
+
+    if not listed:
+        return False
+    if any(not os.path.exists(os.path.join(proj_dir, sf)) for sf in listed):
+        return False
+    return _collect_project_source_files(proj_dir).issubset(listed)
+
+
 def _run_setup_extract(proj_dir, work_dir, script_dir, is_incremental=False):
     """Stage 2: prepare the setup workflow file and run opencode (with retries) to produce phases.json."""
     workflow_src = os.path.join(script_dir, "md", "workflow_setup_extract.md")
@@ -182,9 +261,14 @@ def _run_setup_extract(proj_dir, work_dir, script_dir, is_incremental=False):
             logging.warning(f"Stage 2 attempt {attempt}: opencode exited with code {e.returncode}")
 
         # Validate that the agent produced phases.json. In incremental mode the file
-        # already exists, so require that it was actually modified by this run.
+        # already exists; it may legitimately remain byte-for-byte unchanged for same-file
+        # edits, so accept it when it still covers the current source files.
         if os.path.exists(phases_json):
-            if not is_incremental or os.path.getmtime(phases_json) != prev_mtime:
+            if (
+                not is_incremental
+                or os.path.getmtime(phases_json) != prev_mtime
+                or _phases_cover_current_sources(phases_json, proj_dir)
+            ):
                 break
 
         failure = "update phases.json" if is_incremental else "produce phases.json"
@@ -224,6 +308,89 @@ def _run_opencode_init(proj_dir, work_dir):
             output_files=["AGENTS.md"],
             summary="Initialized OpenCode project context",
         )
+
+@contextlib.contextmanager
+def frozen_worktree(proj_dir, exclude=("fm_agent",)):
+    """Freeze proj_dir's current working tree into an isolated git worktree.
+
+    Captures committed state PLUS uncommitted edits and untracked files, so the
+    yielded copy is a faithful snapshot of proj_dir at entry time. Concurrent
+    edits to proj_dir afterwards do not affect the snapshot, letting the pipeline
+    run against a stable copy.
+
+    The snapshot is built through a private index (GIT_INDEX_FILE), so proj_dir's
+    real index and working tree are never touched. Falls back to a plain directory
+    copy when proj_dir is not a git repository with a commit. The snapshot folder
+    is left in place after the run (including its fm_agent/ outputs); its path is
+    logged so it can be inspected or cleaned up manually.
+
+    The `exclude` dirs (the pipeline's own workspace) are kept out of the git
+    snapshot commit so it stays clean, but are then copied into the worktree as-is.
+    Incremental mode needs the previous run's fm_agent/ results to detect a prior
+    full run, and those results are typically gitignored, hence absent from the
+    snapshot commit.
+    """
+    proj_dir = os.path.abspath(proj_dir)
+    # Include the repo name in the temp dir so concurrent runs across different
+    # repos are distinguishable (e.g. /tmp/fm_agent_wt_myrepo_a3k9d2/snapshot).
+    repo_name = os.path.basename(proj_dir.rstrip(os.sep)) or "repo"
+    base = tempfile.mkdtemp(prefix=f"fm_agent_wt_{repo_name}_")
+    wt = os.path.join(base, "snapshot")
+
+    def _git(*args, **kwargs):
+        return subprocess.run(
+            ["git", "-C", proj_dir, *args],
+            check=True, capture_output=True, text=True, **kwargs,
+        ).stdout.strip()
+
+    is_git = False
+    try:
+        _git("rev-parse", "--verify", "HEAD")
+        is_git = True
+    except subprocess.CalledProcessError:
+        pass
+
+    if is_git:
+        env = dict(os.environ, GIT_INDEX_FILE=os.path.join(base, "index"))
+        _git("read-tree", "HEAD", env=env)
+        # Stage the full working tree (tracked edits + untracked files). Using a
+        # bare `git add -A` lets git silently skip gitignored paths; passing the
+        # workspace dirs as :(exclude) pathspecs instead errors out when a repo
+        # already gitignores them ("paths are ignored ... use -f"). Drop the
+        # workspace dirs from the private index afterwards to cover repos that do
+        # NOT gitignore them.
+        _git("add", "-A", env=env)
+        if exclude:
+            _git("rm", "-r", "--cached", "--quiet", "--ignore-unmatch", "--",
+                 *exclude, env=env)
+        tree = _git("write-tree", env=env)
+        snap = _git("commit-tree", tree, "-p", "HEAD", "-m", "fm_agent snapshot")
+        _git("worktree", "add", "--detach", wt, snap)
+    else:
+        logging.info("frozen_worktree: %s is not a git repo; copying instead.", proj_dir)
+        shutil.copytree(
+            proj_dir, wt,
+            ignore=shutil.ignore_patterns(*exclude),
+            symlinks=True,
+        )
+
+    # Copy the excluded workspace dirs (e.g. fm_agent/ with a prior full run's
+    # phases.json and extracted_functions) into the snapshot. They were kept out
+    # of the git commit, but incremental mode reads them from disk to compare
+    # against, so the snapshot must physically contain them.
+    for name in exclude:
+        src = os.path.join(proj_dir, name)
+        dst = os.path.join(wt, name)
+        if os.path.isdir(src) and not os.path.exists(dst):
+            shutil.copytree(src, dst, symlinks=True)
+
+    print(f"[Pipeline] Snapshot created at: {wt}")
+    print(f"[Pipeline] Snapshot is kept after the run. "
+          f"Remove with: git -C {proj_dir} worktree remove --force {wt}"
+          if is_git else
+          f"[Pipeline] Snapshot is kept after the run. Remove with: rm -rf {wt}")
+    yield wt
+
 
 def run_pipeline(proj_dir):
     if not os.path.isdir(proj_dir):
@@ -496,14 +663,18 @@ if __name__ == "__main__":
 
     proj_dir = os.path.abspath(args.proj_dir)
 
+    if args.incremental and not args.old_commit:
+        parser.error("--old-commit is required when --incremental is set")
+
+    # Resolve the intent path before snapshotting, since cwd-relative paths must
+    # resolve against the real project, not the frozen worktree copy.
+    intent_path = os.path.abspath(args.incremental) if args.incremental else None
+
     start_time = time.time()
-    if args.incremental:
-        if not args.old_commit:
-            parser.error("--old-commit is required when --incremental is set")
-        run_incremental_pipeline(
-            proj_dir, os.path.abspath(args.incremental), args.old_commit
-        )
-    else:
-        run_pipeline(proj_dir)
+    with frozen_worktree(proj_dir) as snap_dir:
+        if args.incremental:
+            run_incremental_pipeline(snap_dir, intent_path, args.old_commit)
+        else:
+            run_pipeline(snap_dir)
     end_time = time.time()
     logging.info(f"Total time: {end_time - start_time:.2f} seconds")

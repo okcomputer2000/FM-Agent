@@ -1,4 +1,5 @@
 import os
+import sys
 import glob
 import json
 import time
@@ -15,6 +16,7 @@ from config import (
     OPENCODE_SETUP_MODEL,
     OPENCODE_MAX_RETRIES,
     MAX_WORKERS,
+    LLM_MODEL,
 )
 from .extract import (
     EXT_TO_LANG,
@@ -38,38 +40,102 @@ from .generate_batch_prompts import (
     extract_spec_block,
 )
 from .opencode_trace import run_opencode_traced
+from .llm_client import _openrouter_client, _llm_call
 from .scope import _parse_issue_signals, rank_functions_in_file
 from .verification import _verify_single_file, _validate_single_bug, EXT_TO_LANG as _VERIFY_EXT_TO_LANG
 
 
+class _StdoutTee:
+    """
+    A write-through stdout replacement that mirrors everything printed to the console into
+    the pipeline log file as well.
+
+    The incremental pipeline calls shared helpers — function re-extraction
+    (run_extraction's verbose SKIP/WRITE/"Extraction complete" lines), top-down layer
+    generation ("[TopdownLayers] ..."), scope ranking (rank_functions_in_file's per-file
+    ranking tables), and the setup-extract retry/error messages — that report progress with
+    bare print() rather than logging.*. Those lines reach stdout but, unlike every
+    logging.* record, are NOT captured by the FileHandler, so they are lost from the on-disk
+    log. Wrapping sys.stdout in this tee routes each print() to both the real console stream
+    and the log file, so the log file holds the complete run output.
+    """
+
+    def __init__(self, console, log_stream):
+        self._console = console
+        self._log_stream = log_stream
+
+    def write(self, data):
+        self._console.write(data)
+        # The log stream is owned by the logging FileHandler; at interpreter shutdown (or if
+        # the handler is closed) it may already be closed, so tolerate that rather than raise
+        # — the console copy still gets through.
+        if not self._log_stream.closed:
+            self._log_stream.write(data)
+        return len(data)
+
+    def flush(self):
+        self._console.flush()
+        if not self._log_stream.closed:
+            self._log_stream.flush()
+
+    def __getattr__(self, name):
+        # Delegate everything else (isatty, fileno, encoding, ...) to the real console
+        # stream. _console is a real attribute, so this never recurses.
+        return getattr(self._console, name)
+
+
 def _setup_incremental_logging(work_dir):
     """
-    Route the incremental pipeline's progress output to a log file (and nothing else).
+    Route the incremental pipeline's progress output to a log file AND stdout.
 
-    Configures the root logger with a single FileHandler at
+    Configures the root logger with a FileHandler at
     work_dir/incremental_<YYYYmmdd_HHMMSS>.log (the timestamp is taken when this is called,
     so each pipeline run writes its own log file rather than overwriting the previous one) so
     every logging.* call in this module — the stage-by-stage progress that used to be
-    print()ed, plus the existing warning/error/exception records — is written to that file
-    instead of the console. Any handlers a previous call (or import) installed are replaced,
-    so invoking the pipeline repeatedly in one process does not duplicate log lines or leak
-    output to stdout. Returns the absolute path of the log file.
+    print()ed, plus the existing warning/error/exception records — is preserved on disk. A
+    second StreamHandler mirrors the same records to stdout, so callers that capture the
+    subprocess output (e.g. the benchmark runner, which greps stdout for the final
+    "confirmed bugs in N function(s)" marker) can see the result without reading the log
+    file. The log file is wiped by the runner's per-trial revert, so stdout is the only
+    place the result reliably survives. Any handlers a previous call (or import) installed
+    are replaced, so invoking the pipeline repeatedly in one process does not duplicate log
+    lines.
+
+    Additionally, sys.stdout is wrapped in an _StdoutTee so the bare print() progress
+    emitted by the shared helpers this pipeline calls (run_extraction's verbose output,
+    generate_topdown_layers, rank_functions_in_file, and _run_setup_extract's retry/error
+    messages) is mirrored into the same log file rather than only reaching the console. The
+    console StreamHandler is bound to the underlying console stream (not the tee), so
+    logging.* records are written to the file exactly once. Returns the absolute path of the
+    log file.
     """
     os.makedirs(work_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = os.path.join(work_dir, f"incremental_{timestamp}.log")
 
-    handler = logging.FileHandler(log_path)
-    handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    )
+    # If a previous call already wrapped stdout, unwrap to the real console stream first so
+    # repeated invocations don't stack tees (each adding another copy of every print()).
+    console_stream = getattr(sys.stdout, "_console", sys.stdout)
+
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    file_handler = logging.FileHandler(log_path)
+    file_handler.setFormatter(formatter)
+    # Bind the console handler to the real console stream, NOT the tee below, so logging.*
+    # records land in the file once (via file_handler) instead of twice (file_handler + tee).
+    console_handler = logging.StreamHandler(console_stream)
+    console_handler.setFormatter(formatter)
 
     root = logging.getLogger()
     root.setLevel(logging.INFO)
-    # File only — replace existing handlers so nothing is emitted to the console.
+    # Replace existing handlers so repeated calls don't duplicate lines, then log to both
+    # the per-run file and stdout.
     for existing in list(root.handlers):
         root.removeHandler(existing)
-    root.addHandler(handler)
+    root.addHandler(file_handler)
+    root.addHandler(console_handler)
+
+    # Mirror bare print() output (from the shared helpers above) into the same log file.
+    sys.stdout = _StdoutTee(console_stream, file_handler.stream)
     return log_path
 
 
@@ -100,11 +166,13 @@ def check_last_run_existence(proj_dir):
     if not os.path.isdir(extracted_dir):
         return False
 
+    saw_function = False
     for root, _, files in os.walk(extracted_dir):
         for fname in files:
+            saw_function = True
             if not is_file_ready(os.path.join(root, fname)):
                 return False
-    return True
+    return saw_function
 
 
 def extract_existing_specs(proj_dir):
@@ -247,11 +315,19 @@ def _collect_changed_functions(proj_dir, old_commit_id):
     untracked = _git(
         "ls-files", "--others", "--exclude-standard", "--", *pathspecs
     ).splitlines()
-    untracked_set = set(untracked)
     files = [
-        f for f in changed + untracked
+        f for f in dict.fromkeys(changed + untracked)
         if not _is_test_file(f) and not _is_workspace_file(f)
     ]
+
+    def _path_exists_in_commit(rel_path):
+        """Return whether rel_path exists at old_commit_id without reading its contents."""
+        return subprocess.run(
+            ["git", "-C", proj_dir, "cat-file", "-e", f"{old_commit_id}:{rel_path}"],
+            check=False,
+            capture_output=True,
+            text=True,
+        ).returncode == 0
 
     def _funcs_from_commit(rel_path, lang_key, ext):
         """Extract {name: source} for the old_commit_id version of rel_path via a temp file."""
@@ -279,7 +355,10 @@ def _collect_changed_functions(proj_dir, old_commit_id):
             new_funcs = {}
 
         # Old-commit functions (empty for files that did not exist at old_commit_id).
-        if rel_path in untracked_set:
+        # A path can be absent from the base even when it is already tracked/staged in the
+        # current tree, so check the base commit directly instead of relying on untracked
+        # status.
+        if not _path_exists_in_commit(rel_path):
             old_funcs = {}
         else:
             old_funcs = _funcs_from_commit(rel_path, lang_key, ext)
@@ -729,6 +808,52 @@ def _opencode_select_json(proj_dir, work_dir, prompt_relpath, prompt_content,
         return None
 
 
+def _llm_select_json(work_dir, prompt_content, stage, trace_meta=None):
+    """
+    Run a single direct LLM call that returns a JSON value, and return the parsed JSON.
+
+    The direct-call counterpart to _opencode_select_json: rather than spawning opencode to
+    read and write project files, this sends prompt_content to the LLM (via src/llm_client)
+    and asks it to emit its answer as JSON wrapped between [JSON] and [JSON] markers, which
+    _llm_call extracts (retrying on a malformed wrapper). It is therefore suitable ONLY for
+    self-contained prompts whose entire context is inlined and which need no repository file
+    access. The exchange is traced under work_dir/trace like the reasoner's LLM calls.
+
+    Returns the parsed JSON value, or None when the call produced no usable [JSON] block or
+    the payload could not be parsed.
+    """
+    messages = [{"role": "user", "content": prompt_content}]
+    meta = {"stage": stage, "summary": f"LLM {stage}", **(trace_meta or {})}
+    raw = _llm_call(
+        _openrouter_client,
+        LLM_MODEL,
+        messages,
+        "JSON",
+        "JSON",
+        trace_dir=os.path.join(work_dir, "trace"),
+        trace_meta=meta,
+    )
+    if raw is None:
+        logging.error("%s: LLM produced no parsable [JSON] block.", stage)
+        return None
+
+    # Tolerate a ```json ... ``` fence inside the [JSON] markers.
+    text = raw.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+
+    try:
+        return json.loads(text)
+    except (ValueError, TypeError) as exc:
+        logging.error("%s: could not parse LLM JSON output: %s", stage, exc)
+        return None
+
+
 def collect_relevent_function_scope(proj_dir, developer_intent, changed_functions, range=None):
     """
     Select the functions relevant to developer_intent and return the most relevant ones.
@@ -737,8 +862,8 @@ def collect_relevent_function_scope(proj_dir, developer_intent, changed_function
     of modules, each with a natural-language description and a list of source_files. This
     narrows the scope to the developer's intent in three passes:
 
-      1. Module selection — opencode (OPENCODE_SETUP_MODEL) reads the module descriptions in
-         phases.json and picks the modules relevant to the intent.
+      1. Module selection — a direct LLM call is given the module descriptions (already
+         parsed from phases.json) and picks the modules relevant to the intent.
       2. File selection — for each relevant module, opencode reads that module's source
          files and picks the files relevant to the intent.
       3. Function selection — the function-localization algorithm from scope.py ranks the
@@ -774,39 +899,43 @@ def collect_relevent_function_scope(proj_dir, developer_intent, changed_function
     if not modules:
         logging.info("    [scope] no modules in phases.json; nothing to select.")
         return []
+
+    changed_source_rels = {
+        os.path.relpath(abs_src, proj_dir).replace(os.sep, "/")
+        for abs_src in changed_functions
+    }
     logging.info("    [scope] pass 1/3: selecting relevant modules from %d module(s)...", len(modules))
 
-    # Pass 1: module selection. opencode reads fm_agent/phases.json itself (the agent's cwd
-    # is proj_dir), reasons over the module descriptions, and writes the selected modules to
-    # a result file we read back.
+    # Pass 1: module selection. The module descriptions are already parsed from phases.json
+    # above, so rather than have opencode read the file, inline the catalog and make a direct
+    # LLM call that returns the selection as JSON.
+    module_catalog = "\n".join(
+        f"- phase {phase_num}, name `{module.get('name', '(unnamed)')}`: "
+        f"{(module.get('description') or '').strip() or '(no description)'}"
+        for phase_num, module in modules
+    )
     module_prompt = (
         "# Select Relevant Modules\n\n"
         "You are triaging which parts of a codebase are relevant to a developer's intent.\n\n"
-        "## Steps\n\n"
-        "1. Read `fm_agent/phases.json`. It lists phases, each containing modules; every "
-        "module has a `name`, a `description`, and a `source_files` list.\n"
-        "2. Using each module's `description`, decide which modules are relevant to the "
-        "developer intent below. A module is relevant if the developer intent is likely to "
-        "affect it or depend on it.\n"
-        "3. Write your answer to `fm_agent/relevant_modules.json` as a JSON array of "
-        'objects, each `{"phase": <phase number>, "name": "<module name>"}`, naming exactly '
-        "the modules you judged relevant (reuse the same `phase` and `name` values from "
-        "phases.json). Write `[]` if no module is relevant. Write ONLY that file; do not "
-        "modify any other project files.\n\n"
+        "Each module below has a `phase` number, a `name`, and a `description`. Using each "
+        "module's description, decide which modules are relevant to the developer intent — a "
+        "module is relevant if the developer intent is likely to affect it or depend on it.\n\n"
+        "## Modules\n\n"
+        f"{module_catalog}\n\n"
         "## Developer intent\n\n"
-        f"{developer_intent}\n"
+        f"{developer_intent}\n\n"
+        "## Output\n\n"
+        "Return ONLY a JSON array of objects, each "
+        '`{"phase": <phase number>, "name": "<module name>"}`, naming exactly the modules you '
+        "judged relevant (reuse the same `phase` and `name` values from the list above). Use "
+        "`[]` if no module is relevant. Wrap the JSON array between `[JSON]` and `[JSON]` "
+        "markers.\n"
     )
-    selection = _opencode_select_json(
-        proj_dir,
-        work_dir,
-        os.path.join("fm_agent", "select_relevant_modules.md"),
-        module_prompt,
-        os.path.join("fm_agent", "relevant_modules.json"),
-        stage="select_relevant_modules",
-        input_files=["fm_agent/select_relevant_modules.md", "fm_agent/phases.json"],
+    selection = _llm_select_json(
+        work_dir, module_prompt, stage="select_relevant_modules",
     )
     if selection is None:
-        return []
+        selection = []
 
     selected_keys = set()
     if isinstance(selection, list):
@@ -817,6 +946,7 @@ def collect_relevent_function_scope(proj_dir, developer_intent, changed_function
     relevant_modules = [
         (phase_num, module) for phase_num, module in modules
         if (phase_num, module.get("name")) in selected_keys
+        or any(sf.replace("\\", "/") in changed_source_rels for sf in module.get("source_files", []))
     ]
     if not relevant_modules:
         logging.info("    [scope] pass 1/3: no relevant modules selected.")
@@ -842,14 +972,19 @@ def collect_relevent_function_scope(proj_dir, developer_intent, changed_function
         if not source_files:
             continue
 
+        source_set = set(source_files)
+        changed_in_module = [
+            sf for sf in source_files
+            if sf.replace("\\", "/") in changed_source_rels
+        ]
         file_list_md = "\n".join(f"- `{sf}`" for sf in source_files)
         file_prompt = (
             "# Select Relevant Files\n\n"
             f"You are triaging which files of the module `{module_name}` are relevant to a "
-            "developer's intent.\n\n"
+            "developer intent.\n\n"
             "## Steps\n\n"
-            "1. Read each of the module's source files listed below.\n"
-            "2. Decide which files are relevant to the developer intent — a file is relevant "
+            "1. Read each of the module source files listed below.\n"
+            "2. Decide which files are relevant to the developer intent -- a file is relevant "
             "if the developer intent is likely to affect it or depend on its behavior.\n"
             f"3. Write your answer to `fm_agent/relevant_files_{idx}.json` as a JSON array of "
             "the relevant file paths, each copied verbatim from the list below. Write `[]` if "
@@ -870,11 +1005,13 @@ def collect_relevent_function_scope(proj_dir, developer_intent, changed_function
             input_files=[f"fm_agent/select_relevant_files_{idx}.md", *source_files],
         )
 
-        source_set = set(source_files)
         if isinstance(file_selection, list):
             chosen = [sf for sf in file_selection if sf in source_set]
+            for sf in changed_in_module:
+                if sf not in chosen:
+                    chosen.append(sf)
         else:
-            # opencode failed for this module — keep all of its files rather than drop scope.
+            # opencode failed for this module; keep all files rather than drop scope.
             chosen = list(source_files)
 
         if chosen:
@@ -1000,19 +1137,21 @@ def _resolve_callee_fqns(caller_fqn, callee_names, callees_map):
     return resolved
 
 
-def _opencode_check_spec_update(proj_dir, work_dir, idx, fqn, lang_key, comment_prefix,
-                                developer_intent, spec_block, info_block, callee_names, source):
+def _llm_check_spec_update(proj_dir, work_dir, idx, fqn, lang_key, comment_prefix,
+                           developer_intent, spec_block, info_block, callee_names, source):
     """
-    Ask opencode whether a function's [SPEC] (and, if so, its [INFO]) block must change to
+    Ask the LLM whether a function's [SPEC] (and, if so, its [INFO]) block must change to
     reflect developer_intent, and return the parsed decision.
+
+    The prompt inlines the entire function source, its current [SPEC]/[INFO] blocks, and the
+    developer intent, so it needs no repository file access and is issued as a direct LLM
+    call (via _llm_select_json) rather than an opencode run. idx is used only to label the
+    traced exchange.
 
     Returns the parsed result dict — keys: "spec_updated" (bool), "new_spec" (str),
     "info_updated" (bool), "new_info" (str), "updated_callees" (list[str]) — or None when
-    opencode produced nothing usable.
+    the LLM produced nothing usable.
     """
-    result_relpath = os.path.join("fm_agent", f"spec_update_{idx}.json")
-    prompt_relpath = os.path.join("fm_agent", f"spec_update_{idx}.md")
-
     callee_hint = ", ".join(sorted(callee_names)) if callee_names else "(none)"
     if not callee_names:
         info_section = "This function has no callees, so there is no [INFO] block to maintain.\n\n"
@@ -1063,43 +1202,38 @@ def _opencode_check_spec_update(proj_dir, work_dir, idx, fqn, lang_key, comment_
         f"(the `[INFO]` ... `[INFO]` block only, markers included, lines prefixed with "
         f"`{comment_prefix}`) and list the names of the callees whose expected spec you added "
         "or changed.\n"
-        f"4. Write your answer to `{result_relpath}` as a JSON object with keys:\n"
+        "4. Return ONLY a JSON object with keys:\n"
         '   - "spec_updated": boolean.\n'
         '   - "new_spec": string — the full replacement [SPEC] block, or "" if not updated.\n'
         '   - "info_updated": boolean — true when you produced a new/replacement [INFO] block.\n'
         '   - "new_info": string — the full replacement [INFO] block, or "" if not updated.\n'
         '   - "updated_callees": array of callee name strings whose expected spec you added or changed, or [].\n'
-        "   Write ONLY that JSON file; do not modify any other project files.\n"
+        "   Wrap the JSON object between `[JSON]` and `[JSON]` markers.\n"
     )
 
-    return _opencode_select_json(
-        proj_dir,
-        work_dir,
-        prompt_relpath,
-        prompt_content,
-        result_relpath,
-        stage="update_function_spec",
-        input_files=[prompt_relpath],
+    return _llm_select_json(
+        work_dir, prompt_content, stage="update_function_spec",
+        trace_meta={"fqn": fqn, "idx": idx},
     )
 
 
-def _opencode_check_caller_info_update(proj_dir, work_dir, idx, caller_fqn, callee_name,
-                                       lang_key, comment_prefix, callee_new_spec,
-                                       caller_info_block, caller_source):
+def _llm_check_caller_info_update(proj_dir, work_dir, idx, caller_fqn, callee_name,
+                                  lang_key, comment_prefix, callee_new_spec,
+                                  caller_info_block, caller_source):
     """
-    Ask opencode whether a caller's [INFO] block must change to stay consistent with a
-    callee whose [SPEC] block was just updated.
+    Ask the LLM whether a caller's [INFO] block must change to stay consistent with a callee
+    whose [SPEC] block was just updated.
 
     The caller's [INFO] block records the expected specs of the callees it depends on. This
-    asks opencode to reconcile only the entry for callee_name with the callee's new spec —
+    asks the model to reconcile only the entry for callee_name with the callee's new spec —
     consistency, not equality: the entry must merely not conflict with the new spec, and the
-    entries for other callees are left untouched. Returns the parsed result dict — keys
-    "info_updated" (bool) and "new_info" (str) — or None when opencode produced nothing
-    usable.
-    """
-    result_relpath = os.path.join("fm_agent", f"caller_info_update_{idx}.json")
-    prompt_relpath = os.path.join("fm_agent", f"caller_info_update_{idx}.md")
+    entries for other callees are left untouched. The prompt inlines the callee's new spec
+    and the caller's source/[INFO], so it is issued as a direct LLM call (via
+    _llm_select_json) rather than an opencode run; idx only labels the traced exchange.
 
+    Returns the parsed result dict — keys "info_updated" (bool) and "new_info" (str) — or
+    None when the LLM produced nothing usable.
+    """
     prompt_content = (
         "# Reconcile a Caller's [INFO] Block with a Changed Callee\n\n"
         f"The callee `{callee_name}`'s behavioral specification was just updated. The caller "
@@ -1122,20 +1256,15 @@ def _opencode_check_caller_info_update(proj_dir, work_dir, idx, caller_fqn, call
         f"`[INFO]` block only, markers included, every line prefixed with `{comment_prefix}`), "
         f"adjusting only the `{callee_name}` entry to be consistent and leaving the other "
         "entries as-is.\n"
-        f"3. Write your answer to `{result_relpath}` as a JSON object with keys:\n"
+        "3. Return ONLY a JSON object with keys:\n"
         '   - "info_updated": boolean.\n'
         '   - "new_info": string — the full replacement [INFO] block, or "" if not updated.\n'
-        "   Write ONLY that JSON file; do not modify any other project files.\n"
+        "   Wrap the JSON object between `[JSON]` and `[JSON]` markers.\n"
     )
 
-    return _opencode_select_json(
-        proj_dir,
-        work_dir,
-        prompt_relpath,
-        prompt_content,
-        result_relpath,
-        stage="update_caller_info",
-        input_files=[prompt_relpath],
+    return _llm_select_json(
+        work_dir, prompt_content, stage="update_caller_info",
+        trace_meta={"caller_fqn": caller_fqn, "callee_name": callee_name, "idx": idx},
     )
 
 
@@ -1351,7 +1480,7 @@ def _update_specs_for_intent(proj_dir, work_dir, developer_intent, changed_funct
         else:
             source = content[len(leading):]
             old_spec, old_info = _split_spec_and_info(leading, comment_prefix, spec_marker)
-            result = _opencode_check_spec_update(
+            result = _llm_check_spec_update(
                 proj_dir, work_dir, idx, fqn, lang_key, comment_prefix,
                 developer_intent, old_spec, old_info, callee_names, source,
             )
@@ -1430,7 +1559,7 @@ def _update_specs_for_intent(proj_dir, work_dir, developer_intent, changed_funct
                 # No callee-contract block to reconcile.
                 continue
 
-            cresult = _opencode_check_caller_info_update(
+            cresult = _llm_check_caller_info_update(
                 proj_dir, work_dir, base_idx + offset, caller_fqn, callee_name, clang, cprefix,
                 callee_new_spec, c_info, csource,
             )

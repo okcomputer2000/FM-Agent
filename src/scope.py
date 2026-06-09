@@ -44,6 +44,7 @@ Output: scope_functions.json
 from __future__ import annotations
 
 import ast
+from difflib import SequenceMatcher
 import json
 import logging
 import re
@@ -82,8 +83,12 @@ W_BACKTICK_BODY    =  2.0
 W_DOTTED_REF       = 15.0   # Class.method explicit reference in issue
 W_PLAIN_NAME       =  3.0
 W_NAME_ALL_WORDS   =  1.5   # function name parts ∩ issue all_words (prose nouns); lower weight to avoid boosting generic names
+W_FUZZY_NAME       =  1.4   # conservative typo-tolerant match against function name parts only
 W_EXCEPTION_MATCH  =  4.0   # issue exception type found in function body
 W_BODY_WORDS       =  1.0   # multiplied by overlap / sqrt(body_lines)
+
+FUZZY_NAME_MIN_LEN   = 5
+FUZZY_NAME_THRESHOLD = 0.75
 
 # Call-graph propagation weights
 CALLEE_INHERIT = 0.30
@@ -239,6 +244,39 @@ def _name_parts(name: str) -> set[str]:
             parts.add(p)
 
     return parts
+
+
+def _fuzzy_name_score(parts: set[str], signals: dict[str, set[str]]) -> float:
+    """Return a small typo-tolerant score for long intent tokens vs function names."""
+    intent_tokens = (
+        signals['backtick_idents']
+        | signals['plain_idents']
+        | signals['dotted_refs']
+        | signals['all_words']
+    )
+    intent_tokens = {
+        t for t in intent_tokens
+        if len(t) >= FUZZY_NAME_MIN_LEN and t not in _STOP and t not in _PY_KEYWORDS
+    }
+    name_tokens = {
+        p for p in parts
+        if len(p) >= FUZZY_NAME_MIN_LEN and p not in _STOP and p not in _PY_KEYWORDS
+    }
+
+    score = 0.0
+    for token in intent_tokens:
+        if token in name_tokens:
+            continue
+        best = 0.0
+        for part in name_tokens:
+            if part in intent_tokens:
+                continue
+            ratio = SequenceMatcher(None, token, part).ratio()
+            if ratio > best:
+                best = ratio
+        if best >= FUZZY_NAME_THRESHOLD:
+            score += W_FUZZY_NAME * best
+    return score
 
 
 def _collect_func_idents(node: ast.FunctionDef | ast.AsyncFunctionDef,
@@ -459,6 +497,10 @@ def _base_score(name: str,
     # like 'add', 'join', 'inline', 'block' that appear in many function names.
     specific_name_words = {p for p in parts if len(p) >= 5}
     score += len(specific_name_words & signals['all_words']) * W_NAME_ALL_WORDS
+
+    # T4c: typo-tolerant fallback for identifier-like intent words.
+    # Keep this name-only and low-weight so broad body prose cannot dominate scope.
+    score += _fuzzy_name_score(parts, signals)
 
     # T5 (NEW): exception type match
     if signals['exception_types'] and exc_types:
