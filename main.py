@@ -22,6 +22,7 @@ import time
 import shutil
 import subprocess
 import logging
+import argparse
 
 def _deduplicate_phases(phases_dir):
     """Ensure each source file appears in at most one phase; keep the earliest."""
@@ -106,6 +107,37 @@ def _get_pending_batches(batches, proj_dir):
     return pending
 
 
+def _json_file_is_valid(path):
+    try:
+        with open(path, "r") as f:
+            json.load(f)
+        return True
+    except (OSError, json.JSONDecodeError):
+        return False
+
+
+def _get_incomplete_verification_files(layer_files, input_dir, output_dir, work_dir):
+    """Return layer files missing verification or required bug validation output."""
+    incomplete = []
+    for rel in layer_files:
+        result_path = os.path.join(output_dir, os.path.splitext(rel)[0] + ".json")
+        try:
+            with open(result_path, "r") as f:
+                result = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            incomplete.append(rel)
+            continue
+
+        if result.get("verdict") != "MISMATCH":
+            continue
+
+        bug_id = os.path.splitext(rel)[0].replace(os.sep, "--").replace("/", "--")
+        validation_path = os.path.join(work_dir, "bug_validation", f"{bug_id}.result.json")
+        if not _json_file_is_valid(validation_path):
+            incomplete.append(rel)
+    return incomplete
+
+
 def _has_source_code(proj_dir):
     """Check whether proj_dir contains at least one source code file."""
     source_exts = set(EXT_TO_LANG.keys())
@@ -167,7 +199,7 @@ def run_pipeline(proj_dir, resume=False):
     print("[Pipeline] Stage 2/5: Understanding codebase and extracting functions ...")
     script_dir = os.path.dirname(os.path.abspath(__file__))
     # On resume, reuse the existing phase plan instead of paying for the
-    # (non-deterministic) setup_context LLM call again.
+    # setup_context LLM call again.
     _resume_skip_setup = resume and os.path.exists(os.path.join(work_dir, "phases.json"))
     if _resume_skip_setup:
         print("[Pipeline] Stage 2/5: RESUME — phases.json found, skipping setup_context (reusing phase plan).")
@@ -259,9 +291,10 @@ def run_pipeline(proj_dir, resume=False):
         os.path.join(script_dir, "src", "generate_batch_prompts.py"),
         os.path.join(spec_prompts_dir, "generate_batch_prompts.py"),
     )
+    # generate_batch_prompts.py imports is_file_ready from this module at runtime.
     shutil.copy2(
-        os.path.join(script_dir, "src", "run_batch_gen.py"),
-        os.path.join(spec_prompts_dir, "run_batch_gen.py"),
+        os.path.join(script_dir, "src", "file_utils.py"),
+        os.path.join(spec_prompts_dir, "file_utils.py"),
     )
 
     print("[Pipeline] Stage 3/5: Collecting file list...")
@@ -313,12 +346,13 @@ def run_pipeline(proj_dir, resume=False):
         for layer_idx in range(total_layers):
             print(f"[Pipeline] Stage 5/5: Phase {phase_num}/{num_phases} — {phase_name}, Layer {layer_idx}/{total_layers - 1}")
 
-            # Generate batch prompts for this layer
-            subprocess.run(
-                ["python3", "fm_agent/spec_prompts/generate_batch_prompts.py",
-                 "--phase", str(phase_num), "--layers", str(layer_idx)],
-                cwd=proj_dir, check=True,
-            )
+            # Generate batch prompts for this layer. On resume, skip functions
+            # that were already specced in a previous run.
+            batch_cmd = ["python3", "fm_agent/spec_prompts/generate_batch_prompts.py",
+                         "--phase", str(phase_num), "--layers", str(layer_idx)]
+            if resume:
+                batch_cmd.append("--resume")
+            subprocess.run(batch_cmd, cwd=proj_dir, check=True)
 
             # Read manifest
             manifest_path = os.path.join(batch_dir, "manifest.json")
@@ -345,6 +379,22 @@ def run_pipeline(proj_dir, resume=False):
                 # Find batches with unspecced functions
                 pending_batches = _get_pending_batches(all_batches, proj_dir)
                 if not pending_batches:
+                    incomplete_verification = _get_incomplete_verification_files(
+                        layer_files, input_dir, output_dir, work_dir
+                    )
+                    if incomplete_verification:
+                        logging.info(
+                            f"Phase {phase_num} Layer {layer_idx}: "
+                            f"{len(incomplete_verification)} ready file(s) still need verification or validation"
+                        )
+                        newly_processed = streaming_reasoner(
+                            input_dir, output_dir, file_list=layer_files,
+                            proj_dir=proj_dir, work_dir=work_dir,
+                            spec_procs=None,
+                            already_processed=all_processed | layer_processed,
+                            resume=resume,
+                        )
+                        layer_processed.update(newly_processed)
                     break
 
                 # Spawn concurrent opencode processes (one per pending batch)
@@ -354,6 +404,12 @@ def run_pipeline(proj_dir, resume=False):
                     batch_file = batch_info["file"]
                     batch_prompt_rel = os.path.join(batch_rel_dir, batch_file)
                     batch_prompt_abs = os.path.join(proj_dir, batch_prompt_rel)
+                    # On resume a batch whose functions are all already specced
+                    # has no prompt file written and nothing for the agent to do
+                    # — skip it instead of sending an empty batch.
+                    if batch_info.get("num_pending", 1) == 0 or not os.path.exists(batch_prompt_abs):
+                        logging.info(f"Skipping batch with no functions to spec: {batch_file}")
+                        continue
                     function_files = batch_info.get("functions", [])
                     function_ids = [
                         function_id_from_extracted_path(func_rel)
@@ -410,7 +466,8 @@ def run_pipeline(proj_dir, resume=False):
                 newly_processed = streaming_reasoner(input_dir, output_dir, file_list=layer_files,
                                    proj_dir=proj_dir, work_dir=work_dir,
                                    spec_procs=spec_procs,
-                                   already_processed=all_processed | layer_processed)
+                                   already_processed=all_processed | layer_processed,
+                                   resume=resume)
                 layer_processed.update(newly_processed)
 
                 for proc in spec_procs:
@@ -471,17 +528,22 @@ def run_pipeline(proj_dir, resume=False):
 
 
 if __name__ == "__main__":
-    args = [a for a in sys.argv[1:] if not a.startswith("-")]
-    flags = {a for a in sys.argv[1:] if a.startswith("-")}
-    if not args:
-        print("Usage: python3 main.py <proj_dir> [--resume]")
-        print("  --resume   continue a previous run in <proj_dir>/fm_agent instead of")
-        print("             wiping it: keeps phases.json, generated specs, and existing")
-        print("             verification results; only does the remaining work.")
-        sys.exit(1)
-
-    resume = "--resume" in flags or os.environ.get("FM_AGENT_RESUME") == "1"
+    parser = argparse.ArgumentParser(
+        usage="python3 main.py <proj_dir> [--resume]",
+        description="Run the FM agent pipeline on a project directory.",
+    )
+    parser.add_argument("proj_dir", help="path to the project directory")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="continue a previous run in <proj_dir>/fm_agent instead of wiping it: "
+        "keeps phases.json, generated specs, and existing verification results; "
+        "only does the remaining work.",
+    )
+    parsed = parser.parse_args()
+    resume = parsed.resume or os.environ.get("FM_AGENT_RESUME") == "1"
+    
     start_time = time.time()
-    run_pipeline(os.path.abspath(args[0]), resume=resume)
+    run_pipeline(os.path.abspath(parsed.proj_dir), resume=resume)
     end_time = time.time()
     logging.info(f"Total time: {end_time - start_time:.2f} seconds")
