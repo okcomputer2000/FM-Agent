@@ -41,8 +41,9 @@ from .generate_batch_prompts import (
 )
 from .opencode_trace import run_opencode_traced
 from .llm_client import _llm_provider_client, _llm_call
+from .prompts import _load_spec_check_json
 from .scope import _parse_issue_signals, rank_functions_in_file
-from .verification import _verify_single_file, _validate_single_bug, EXT_TO_LANG as _VERIFY_EXT_TO_LANG
+from .verification import _verify_single_file, _validate_single_bug, _generate_validation_summary, EXT_TO_LANG as _VERIFY_EXT_TO_LANG
 
 
 class _StdoutTee:
@@ -837,18 +838,9 @@ def _llm_select_json(work_dir, prompt_content, stage, trace_meta=None):
         logging.error("%s: LLM produced no parsable [JSON] block.", stage)
         return None
 
-    # Tolerate a ```json ... ``` fence inside the [JSON] markers.
-    text = raw.strip()
-    if text.startswith("```"):
-        lines = text.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        text = "\n".join(lines).strip()
-
+    # Tolerate strict, fenced, or prose-wrapped JSON inside the [JSON] markers.
     try:
-        return json.loads(text)
+        return _load_spec_check_json(raw)
     except (ValueError, TypeError) as exc:
         logging.error("%s: could not parse LLM JSON output: %s", stage, exc)
         return None
@@ -868,12 +860,8 @@ def collect_relevent_function_scope(proj_dir, developer_intent, changed_function
          files and picks the files relevant to the intent.
       3. Function selection — the function-localization algorithm from scope.py ranks the
          functions in each chosen file by relevance to the intent (heuristic signal scoring
-         with call-graph, class-scope, proximity, and git-history enrichments) and keeps the
-         top-ranked functions per file.
-
-    The selected functions are mapped back to their extracted-function files. A chosen file
-    that scope.py cannot localize within (e.g. a non-Python source it cannot AST-parse, or a
-    parse failure) contributes all of its extracted functions rather than being dropped.
+         with call-graph and class-scope enrichments) and keeps the top-ranked functions
+         per file.
 
     range, when given, caps the result to the first (most relevant) `range` functions; pass
     None to return all of them.
@@ -1063,7 +1051,6 @@ def collect_relevent_function_scope(proj_dir, developer_intent, changed_function
                     src_path=src_path,
                     issue=developer_intent,
                     signals=signals,
-                    repo_dir=repo_dir,
                 )
 
             if ranked:
@@ -1788,6 +1775,9 @@ def _verify_incremental_functions(proj_dir, work_dir, changed_functions, updated
                 future.result()
             except Exception:
                 logging.exception("Bug validation failed for %s", rel)
+
+    # Summarize all validation results into work_dir/bug_validation/summary.json, like run_pipeline.
+    _generate_validation_summary(work_dir)
 
     # Collect the MISMATCHes that bug validation confirmed as real bugs. bug_id is the
     # result-relative path with separators replaced by "--".

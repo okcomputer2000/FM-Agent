@@ -13,7 +13,7 @@ recovered by regex (class-scope narrowing is Python-only).
 
 Pipeline
 --------
-Stage 1 – Heuristic scoring  (always runs, ~25 ms/file, no LLM cost)
+Stage 1 – Heuristic scoring  (always runs, no LLM cost)
     Five signal tiers extracted from the issue text, in decreasing weight:
         T1  Traceback function names ("  in func_name")            ×10
         T2  Backtick / code-block identifiers                     ×5 (name), ×2 (body)
@@ -26,10 +26,6 @@ Stage 1 – Heuristic scoring  (always runs, ~25 ms/file, no LLM cost)
         • Intra-file call-graph propagation (callee ×0.30, caller ×0.20)
         • Class-scope narrowing (NEW): score classes by name/docstring
           overlap with issue, then boost all methods of top-matching classes
-        • Proximity boost (NEW): after scoring, functions within W lines of
-          an already-high-scoring function inherit a proximity bonus
-        • Git-history boost (NEW): functions touched in the last N commits
-          on this file get an additive score bonus
 
 Stage 2 – LLM re-ranking  (optional, triggered when file has ≥ LLM_TRIGGER_FUNCS
     unique functions after dedup, or heuristic top score < confidence threshold)
@@ -48,7 +44,6 @@ from difflib import SequenceMatcher
 import json
 import logging
 import re
-import subprocess
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -101,18 +96,6 @@ W_CLASS_DOC_MATCH    = 2.0  # per overlapping token between class docstring and 
 # Absolute cap: per-method bonus ≤ CLASS_BOOST_CAP regardless of class score.
 CLASS_METHOD_INHERIT = 0.40 # fraction of class score passed to every method
 CLASS_BOOST_CAP      = 8.0  # hard cap on per-method class bonus
-
-# Proximity boost (NEW)
-PROXIMITY_WINDOW   = 120    # lines: boost funcs within this many lines of a top scorer
-W_PROXIMITY        = 2.0    # bonus for being within the proximity window
-PROXIMITY_TOP_N    =  5     # consider the top-N scorers as proximity anchors
-
-# Git history (NEW)
-GIT_HISTORY_COMMITS = 20    # how many recent commits to inspect
-W_GIT_HISTORY       =  2.0  # bonus for functions touched in recent commits
-# Only apply git bonus when the function has at least some existing signal —
-# prevents unrelated but recently-touched utility functions from flooding the list.
-GIT_MIN_BASE_SCORE  =  1.0  # minimum base score before git bonus applies; prevents unrelated recently-touched utility functions from flooding
 
 # Python keywords that are too noisy as backtick identifiers
 _PY_KEYWORDS = frozenset({
@@ -382,55 +365,6 @@ def _score_class(cls: dict, signals: dict[str, set[str]]) -> float:
     return score
 
 
-# ── git history signal (NEW) ──────────────────────────────────────────────────
-
-def _git_recently_changed_funcs_precise(repo_dir: Path,
-                                         filepath: str,
-                                         funcs_info: list[dict],
-                                         n_commits: int = GIT_HISTORY_COMMITS) -> dict[int, float]:
-    """
-    Get per-function recency scores from git history.
-
-    Strategy: one `git log --unified=0 -- <file>` call fetches all recent
-    hunks, then we map hunk line numbers to functions.  This is O(1) git
-    calls regardless of the number of functions, keeping latency ~30 ms.
-
-    Recency: each commit contributes 0.85^rank to functions it touched, so
-    the most-recently-touched function gets the highest score.  The per-
-    function score is capped at W_GIT_HISTORY.
-    """
-    func_scores: dict[int, float] = defaultdict(float)
-    try:
-        result = subprocess.run(
-            ['git', 'log', f'-{n_commits}', '--format=%H', '--', filepath],
-            cwd=str(repo_dir), capture_output=True, text=True, timeout=10,
-        )
-        commits = result.stdout.strip().splitlines()
-        for rank, commit in enumerate(commits[:10]):
-            diff = subprocess.run(
-                ['git', 'diff', f'{commit}^', commit, '--unified=0', '--', filepath],
-                cwd=str(repo_dir), capture_output=True, text=True, timeout=10,
-            )
-            touched_lines: set[int] = set()
-            for m in re.finditer(r'@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@',
-                                  diff.stdout):
-                start = int(m.group(1))
-                count = int(m.group(2)) if m.group(2) is not None else 1
-                for ln in range(start, start + max(count, 1)):
-                    touched_lines.add(ln)
-            if not touched_lines:
-                continue
-            commit_weight = 0.85 ** rank  # most recent = 1.0
-            for f in funcs_info:
-                if any(f['start'] <= ln <= f['end'] for ln in touched_lines):
-                    func_scores[f['start']] += commit_weight
-    except Exception:
-        pass
-    # Cap each function's score at W_GIT_HISTORY
-    return {lineno: min(score, W_GIT_HISTORY)
-            for lineno, score in func_scores.items()}
-
-
 # ── heuristic scoring ────────────────────────────────────────────────────────
 
 def _base_score(name: str,
@@ -482,16 +416,13 @@ def _base_score(name: str,
 
 def _rank_functions(funcs_info: list[dict],
                     classes: list[dict],
-                    signals: dict[str, set[str]],
-                    git_scores: dict[int, float]) -> list[dict]:
+                    signals: dict[str, set[str]]) -> list[dict]:
     """
     Score every function, apply all enrichments, return sorted list.
 
     Enrichments (applied additively after base score):
         1. Intra-file call-graph propagation
         2. Class-scope narrowing: boost methods of top-matching classes
-        3. Git history boost: per-function recency score from git log -L
-        4. Proximity boost: applied after initial ranking (see below)
     """
     # ── base scores ──
     for f in funcs_info:
@@ -535,38 +466,7 @@ def _rank_functions(funcs_info: list[dict],
         for f in funcs_info:
             f['score'] += class_bonus[f['start']]
 
-    # ── 3. git history boost (precise per-function recency) ──
-    for f in funcs_info:
-        git_recency = git_scores.get(f['start'], 0.0)
-        if git_recency > 0 and f['score'] >= GIT_MIN_BASE_SCORE:
-            f['score'] += git_recency
-
-    # ── sort (proximity applied later, after dedup) ──
     return sorted(funcs_info, key=lambda x: -x['score'])
-
-
-def _apply_proximity_boost(deduped: list[dict]) -> list[dict]:
-    """
-    Boost functions that are physically close (in source lines) to the top
-    PROXIMITY_TOP_N scorers. Modifies scores in place and re-sorts.
-    """
-    if len(deduped) < 2:
-        return deduped
-    anchors = deduped[:PROXIMITY_TOP_N]
-    anchor_mids = [(a['start'] + a['end']) / 2 for a in anchors]
-    anchor_score = [a['score'] for a in anchors]
-
-    for f in deduped[PROXIMITY_TOP_N:]:
-        f_mid = (f['start'] + f['end']) / 2
-        for amid, ascr in zip(anchor_mids, anchor_score):
-            dist = abs(f_mid - amid)
-            if dist <= PROXIMITY_WINDOW and ascr > 0:
-                # Proximity bonus scales with anchor score and inverse distance
-                proximity_factor = 1.0 - dist / PROXIMITY_WINDOW
-                f['score'] += ascr * proximity_factor * W_PROXIMITY / max(ascr, 1.0)
-                break  # only boost from nearest anchor once
-
-    return sorted(deduped, key=lambda x: -x['score'])
 
 
 # ── LLM re-ranking (Stage 2) ─────────────────────────────────────────────────
@@ -780,7 +680,6 @@ def rank_functions_in_file(
     src_path: Path,
     issue: str,
     signals: dict[str, set[str]],
-    repo_dir: Path | None = None,          # NEW: for git history
     top_k: int = TOP_K,
     llm_client: Any = None,
     llm_model: str = '',
@@ -799,15 +698,8 @@ def rank_functions_in_file(
         print(f"  [scope] {filepath}: no functions found, skipping")
         return []
 
-    # Git history signal: precise per-function recency via git log -L
-    git_scores: dict[int, float] = {}
-    if repo_dir is not None:
-        git_scores = _git_recently_changed_funcs_precise(
-            repo_dir, filepath, funcs_info
-        )
-
     # Stage 1: heuristic scoring with all enrichments
-    ranked = _rank_functions(funcs_info, classes or [], signals, git_scores)
+    ranked = _rank_functions(funcs_info, classes or [], signals)
 
     # Deduplicate by name (keep highest-scored occurrence per name)
     seen_names: dict[str, dict] = {}
@@ -817,20 +709,12 @@ def rank_functions_in_file(
             seen_names[f['name']] = f
             deduped_ranked.append(f)
 
-    # Proximity boost (after dedup, so anchors are the right unique functions)
-    deduped_ranked = _apply_proximity_boost(deduped_ranked)
-
     # ── print per-file function scores ──────────────────────────────────────
     print(f"\n{'─' * 70}")
     print(f"FILE: {filepath}  ({len(deduped_ranked)} unique functions)")
     if classes:
         class_names = [c['name'] for c in classes]
         print(f"  classes found: {class_names}")
-    if git_scores:
-        git_funcs = [
-            f['name'] for f in funcs_info if f['start'] in git_scores
-        ]
-        print(f"  git-recently-changed functions: {git_funcs}")
     print(f"  {'rank':>4}  {'score':>8}  {'name'}")
     print(f"  {'----':>4}  {'-------':>8}  {'----'}")
     for rank, f in enumerate(deduped_ranked, 1):
