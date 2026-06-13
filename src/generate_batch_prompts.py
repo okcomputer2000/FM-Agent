@@ -6,7 +6,13 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 # file_utils.py sits beside this script after being copied into fm_agent/spec_prompts/.
-from file_utils import is_file_ready
+try:
+    # When imported as part of the src package (e.g. incremental_reasoner).
+    from .file_utils import is_file_ready
+except ImportError:
+    # When run standalone after being copied into fm_agent/spec_prompts/,
+    # where file_utils.py sits beside this script.
+    from file_utils import is_file_ready
 
 
 COMMENT_PREFIX_BY_LANG = {

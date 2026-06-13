@@ -32,12 +32,12 @@ OPENCODE_TIMEOUT_SECONDS = int(os.environ.get("OPENCODE_TIMEOUT_SECONDS", "1800"
 
 # Function-selection scope knobs
 # Max number of functions retained per source file in the final scoped output.
-SCOPE_TOP_K = int(os.environ.get("SCOPE_TOP_K", "3"))
+SCOPE_TOP_K = int(os.environ.get("SCOPE_TOP_K", "5"))
 # Run LLM re-ranking when a file has at least this many deduplicated functions.
-SCOPE_LLM_TRIGGER_FUNCS = int(os.environ.get("SCOPE_LLM_TRIGGER_FUNCS", "3"))
+SCOPE_LLM_TRIGGER_FUNCS = int(os.environ.get("SCOPE_LLM_TRIGGER_FUNCS", "5"))
 # Number of candidate functions requested from the LLM during re-ranking.
 # Final output per file is still capped by SCOPE_TOP_K.
-SCOPE_LLM_TOP_K = int(os.environ.get("SCOPE_LLM_TOP_K", "3"))
+SCOPE_LLM_TOP_K = int(os.environ.get("SCOPE_LLM_TOP_K", "5"))
 # Run LLM re-ranking when heuristic top score is below this threshold.
 SCOPE_LLM_CONFIDENCE_THRESHOLD = float(
 	os.environ.get("SCOPE_LLM_CONFIDENCE_THRESHOLD", "8.0")
