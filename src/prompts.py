@@ -1,6 +1,6 @@
 from config import *
 import json
-from .llm_client import _openrouter_client, _retry_create, _llm_call
+from .llm_client import _llm_provider_client, _retry_create, _llm_call
 from .trace_writer import (
     new_event_id,
     record_llm_exchange,
@@ -8,10 +8,45 @@ from .trace_writer import (
 )
 
 
+def _load_spec_check_json(response):
+    """Load the first JSON object from strict, fenced, or prose-wrapped output."""
+    text = (response or "").strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as direct_exc:
+        fence_variants = (
+            ("```json", "```"),
+            ("```JSON", "```"),
+            ("```", "```"),
+            ("json```", "```"),
+            ("JSON```", "```"),
+        )
+        for prefix, suffix in fence_variants:
+            if text.startswith(prefix) and text.endswith(suffix):
+                fenced_text = text[len(prefix):-len(suffix)].strip()
+                try:
+                    return json.loads(fenced_text)
+                except json.JSONDecodeError:
+                    pass
+
+        decoder = json.JSONDecoder()
+        for index, char in enumerate(text):
+            if char != "{":
+                continue
+            try:
+                data, _ = decoder.raw_decode(text[index:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data, dict):
+                return data
+
+        raise direct_exc
+
+
 def _parse_spec_check_json(response):
     """Parse and validate the spec-check model structured JSON verdict."""
     try:
-        data = json.loads((response or "").strip())
+        data = _load_spec_check_json(response)
     except json.JSONDecodeError as exc:
         raise ValueError(f"spec-check response is not valid JSON: {exc}") from exc
 
@@ -31,6 +66,8 @@ def _parse_spec_check_json(response):
     def _nonempty_string(value):
         return isinstance(value, str) and bool(value.strip())
 
+    data["verdict"] = verdict
+
     if verdict == "MISMATCH":
         missing = [
             name for name, value in (
@@ -44,12 +81,18 @@ def _parse_spec_check_json(response):
             raise ValueError(
                 "spec-check MISMATCH JSON missing non-empty field(s): " + ", ".join(missing)
             )
-        return True, offending_statements.strip(), reason.strip(), data
+        data["counterexample"] = counterexample.strip()
+        data["offending_statements"] = offending_statements.strip()
+        data["reason"] = reason.strip()
+        return True, data["offending_statements"], data["reason"], data
 
     if _nonempty_string(counterexample) or _nonempty_string(offending_statements):
         raise ValueError(
             "spec-check MATCH JSON must not include counterexample or offending_statements"
         )
+    data["counterexample"] = None
+    data["offending_statements"] = None
+    data["reason"] = reason.strip() if isinstance(reason, str) else ""
     return False, None, None, data
 
 
@@ -79,7 +122,7 @@ def _generate_block_post_condition(block, pre_condition, knowledge, language,
         **(trace_meta or {}),
     }
     return _llm_call(
-        _openrouter_client,
+        _llm_provider_client,
         REASONER_POST_CONDITION_MODEL,
         messages,
         "POST_START",
@@ -220,7 +263,7 @@ def _check_post_implies_spec(block, post_condition, spec_post_condition, knowled
             "\"offending_statements\": string|null, \"reason\": string}. "
             "For MISMATCH, counterexample, offending_statements, and reason must be non-empty strings; "
             "offending_statements must preserve any 'Line N:' prefixes from the code block. "
-            "For MATCH, counterexample and offending_statements must be null or empty, and reason should explain why no counterexample exists."
+            "For MATCH, counterexample and offending_statements must be null or empty, and reason may be empty."
         )},
         {"role": "user", "content": (
             f"Programming language: {language}\n\n"
@@ -240,7 +283,7 @@ def _check_post_implies_spec(block, post_condition, spec_post_condition, knowled
         response = None
         usage = {}
         try:
-            response, usage = _retry_create(_openrouter_client, REASONER_SPEC_CHECK_MODEL, messages)
+            response, usage = _retry_create(_llm_provider_client, REASONER_SPEC_CHECK_MODEL, messages)
         except Exception as exc:
             event = {
                 "event_id": event_id,
@@ -297,7 +340,7 @@ def _check_post_implies_spec(block, post_condition, spec_post_condition, knowled
             else:
                 return True, None, None, None
         messages = messages + [
-            {"role": "assistant", "content": response},
+            {"role": "assistant", "content": response or ""},
             {
                 "role": "user",
                 "content": (
@@ -307,7 +350,7 @@ def _check_post_implies_spec(block, post_condition, spec_post_condition, knowled
                     "\"offending_statements\": string|null, "
                     "\"reason\": string}. "
                     "For MISMATCH, all evidence fields must be non-empty strings. "
-                    "For MATCH, counterexample and offending_statements must be null or empty."
+                    "For MATCH, counterexample and offending_statements must be null or empty, and reason may be empty."
                 ),
             }
         ]

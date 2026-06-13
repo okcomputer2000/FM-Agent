@@ -5,6 +5,7 @@ from config import (
     OPENCODE_MODEL_PROVIDER,
     LLM_MODEL,
 )
+from src.entry_reasoning_pipeline import run_entry_pipeline
 from src.file_utils import collect_file_names, is_file_ready
 from src.verification import streaming_reasoner
 from src.extract import run_extraction, EXT_TO_LANG, _is_test_file
@@ -183,6 +184,79 @@ def _get_pending_batches(batches, proj_dir):
     return pending
 
 
+def _json_file_is_valid(path):
+    try:
+        with open(path, "r") as f:
+            json.load(f)
+        return True
+    except (OSError, json.JSONDecodeError):
+        return False
+
+
+def _get_incomplete_verification_files(layer_files, input_dir, output_dir, work_dir):
+    """Return layer files missing verification or required bug validation output."""
+    incomplete = []
+    for rel in layer_files:
+        result_path = os.path.join(output_dir, os.path.splitext(rel)[0] + ".json")
+        try:
+            with open(result_path, "r") as f:
+                result = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            incomplete.append(rel)
+            continue
+
+        if result.get("verdict") != "MISMATCH":
+            continue
+
+        bug_id = os.path.splitext(rel)[0].replace(os.sep, "--").replace("/", "--")
+        validation_path = os.path.join(work_dir, "bug_validation", f"{bug_id}.result.json")
+        if not _json_file_is_valid(validation_path):
+            incomplete.append(rel)
+    return incomplete
+
+
+def _setup_outputs_complete(work_dir):
+    """Return True only if the setup_context stage produced ALL its output files.
+
+    The setup stage (Stage 2) is responsible for writing, per
+    md/workflow_setup_extract.md:
+      1. phases.json
+      2. spec_prompts/domain_context/engine_overview.txt
+      3. spec_prompts/domain_context/phase_NN_types.txt — one per phase
+
+    An interrupted run can leave phases.json behind without the domain-context
+    files, which are later read by the spec-generation batch prompts. Resuming
+    must only skip setup when every one of these exists, otherwise the missing
+    files have to be regenerated.
+    """
+    phases_path = os.path.join(work_dir, "phases.json")
+    if not _json_file_is_valid(phases_path):
+        return False
+
+    domain_dir = os.path.join(work_dir, "spec_prompts", "domain_context")
+    if not os.path.exists(os.path.join(domain_dir, "engine_overview.txt")):
+        return False
+
+    try:
+        with open(phases_path, "r") as f:
+            phases_data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+
+    for phase in phases_data.get("phases", []):
+        phase_num = phase.get("phase")
+        if phase_num is None:
+            # Malformed phases.json — can't verify this phase's types file, and
+            # downstream stages require p["phase"]. Re-run setup rather than
+            # claim completeness.
+            return False
+        types_path = os.path.join(domain_dir, f"phase_{phase_num:02d}_types.txt")
+        if not os.path.exists(types_path):
+            return False
+
+    return True
+
+
 def _has_source_code(proj_dir):
     """Check whether proj_dir contains at least one source code file."""
     source_exts = set(EXT_TO_LANG.keys())
@@ -235,8 +309,14 @@ def _phases_cover_current_sources(phases_json, proj_dir):
     return _collect_project_source_files(proj_dir).issubset(listed)
 
 
-def _run_setup_extract(proj_dir, work_dir, script_dir, is_incremental=False):
+def _run_setup_extract(proj_dir, work_dir, script_dir, is_incremental=False, resume=False):
     """Stage 2: prepare the setup workflow file and run opencode (with retries) to produce phases.json."""
+    # On resume, reuse the existing phase plan instead of paying for the
+    # setup_context LLM call again.
+    _resume_skip_setup = resume and _setup_outputs_complete(work_dir)
+    if _resume_skip_setup:
+        print("[Pipeline] Stage 2/5: RESUME — all setup outputs found, skipping setup_context (reusing phase plan).")
+
     workflow_src = os.path.join(script_dir, "md", "workflow_setup_extract.md")
     workflow_dst = os.path.join(work_dir, "workflow_setup_extract.md")
     shutil.copy2(workflow_src, workflow_dst)
@@ -268,11 +348,22 @@ def _run_setup_extract(proj_dir, work_dir, script_dir, is_incremental=False):
     prev_mtime = os.path.getmtime(phases_json) if os.path.exists(phases_json) else None
 
     for attempt in range(1, OPENCODE_MAX_RETRIES + 1):
-        if attempt == 1:
+        if _resume_skip_setup:
+            break
+        if attempt == 1 and not resume:
             prompt = f"Follow the instructions in the attached file. {fm_reminder}"
         else:
-            prompt = ("Continue where you left off. The previous run was interrupted by a network error. "
-                      f"Check what has already been done and only complete the remaining steps. {fm_reminder}")
+            # Either resuming a previously interrupted run or retrying after a
+            # failed attempt — in both cases some setup outputs may already
+            # exist (e.g. phases.json or part of the domain-context files). Have
+            # the agent inspect what's there and only fill the gaps instead of
+            # regenerating everything and overwriting valid work.
+            prompt = ("A previous setup attempt was interrupted and may have already produced some of the "
+                      "required output files. Follow the instructions in the attached file, but FIRST "
+                      "check the current progress in fm_agent/ (e.g. phases.json and the "
+                      "spec_prompts/domain_context/ files). Keep any existing valid output as-is and only "
+                      "generate the files that are missing or incomplete — do NOT regenerate or overwrite "
+                      f"work that is already done. {fm_reminder}")
         if is_incremental:
             prompt = f"{prompt} {incremental_reminder}"
         command = ["opencode", "run", "--model", f"{OPENCODE_MODEL_PROVIDER}/{OPENCODE_SETUP_MODEL}",
@@ -322,7 +413,7 @@ def _run_setup_extract(proj_dir, work_dir, script_dir, is_incremental=False):
                 f"Check {os.path.basename(proj_dir)}/fm_agent/trace/ for details."
             )
             sys.exit(1)
-    
+
     # Deduplicate source files across phases
     _deduplicate_phases(work_dir)
 
@@ -428,7 +519,7 @@ def frozen_worktree(proj_dir, exclude=("fm_agent",), copy_excluded=True):
     yield wt
 
 
-def run_pipeline(proj_dir):
+def run_pipeline(proj_dir, resume=False):
     if not os.path.isdir(proj_dir):
         print(f"[Pipeline] ERROR: proj_dir does not exist or is not a directory: {proj_dir}")
         sys.exit(1)
@@ -443,8 +534,17 @@ def run_pipeline(proj_dir):
     output_dir = os.path.join(work_dir, "logic_verification_results")
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
-    # Clean files from the previous run
-    _clean_previous_run(work_dir)
+    # Clean files from the previous run — unless resuming, where we keep all
+    # prior progress (phases.json, generated specs, verification results) and
+    # only do the remaining work.
+    if resume:
+        if os.path.isdir(work_dir):
+            print(f"[Pipeline] RESUME: keeping existing {os.path.relpath(work_dir, proj_dir)}/ — only remaining work will run.")
+        else:
+            print("[Pipeline] RESUME requested but no previous fm_agent/ found — starting fresh.")
+            resume = False
+    else:
+        _clean_previous_run(work_dir)
     os.makedirs(work_dir, exist_ok=True)
 
     # Initialize opencode in the project directory (skip if AGENTS.md already exists)
@@ -452,11 +552,13 @@ def run_pipeline(proj_dir):
 
     # Copy workflow_setup_extract.md to proj_dir and run opencode against it
     print("[Pipeline] Stage 2/5: Understanding codebase and extracting functions ...")
-    _run_setup_extract(proj_dir, work_dir, script_dir)
+    _run_setup_extract(proj_dir, work_dir, script_dir, resume=resume)
 
     # Run function extraction using extract.py
+    # force=False on resume preserves already-specced extracted files; on a fresh
+    # run fm_agent/ was just wiped so it is equivalent to force=True.
     print("[Pipeline] Extracting functions from source files...")
-    run_extraction(proj_dir, work_dir=work_dir, force=True, verbose=True)
+    run_extraction(proj_dir, work_dir=work_dir, force=not resume, verbose=True)
 
     # Copy system_prompt.md to spec_prompts/system_prompt.md
     spec_prompts_dir = os.path.join(work_dir, "spec_prompts")
@@ -469,9 +571,10 @@ def run_pipeline(proj_dir):
         os.path.join(script_dir, "src", "generate_batch_prompts.py"),
         os.path.join(spec_prompts_dir, "generate_batch_prompts.py"),
     )
+    # generate_batch_prompts.py imports is_file_ready from this module at runtime.
     shutil.copy2(
-        os.path.join(script_dir, "src", "run_batch_gen.py"),
-        os.path.join(spec_prompts_dir, "run_batch_gen.py"),
+        os.path.join(script_dir, "src", "file_utils.py"),
+        os.path.join(spec_prompts_dir, "file_utils.py"),
     )
 
     print("[Pipeline] Stage 3/5: Collecting file list...")
@@ -523,12 +626,13 @@ def run_pipeline(proj_dir):
         for layer_idx in range(total_layers):
             print(f"[Pipeline] Stage 5/5: Phase {phase_num}/{num_phases} — {phase_name}, Layer {layer_idx}/{total_layers - 1}")
 
-            # Generate batch prompts for this layer
-            subprocess.run(
-                ["python3", "fm_agent/spec_prompts/generate_batch_prompts.py",
-                 "--phase", str(phase_num), "--layers", str(layer_idx)],
-                cwd=proj_dir, check=True,
-            )
+            # Generate batch prompts for this layer. On resume, skip functions
+            # that were already specced in a previous run.
+            batch_cmd = ["python3", "fm_agent/spec_prompts/generate_batch_prompts.py",
+                         "--phase", str(phase_num), "--layers", str(layer_idx)]
+            if resume:
+                batch_cmd.append("--resume")
+            subprocess.run(batch_cmd, cwd=proj_dir, check=True)
 
             # Read manifest
             manifest_path = os.path.join(batch_dir, "manifest.json")
@@ -555,6 +659,22 @@ def run_pipeline(proj_dir):
                 # Find batches with unspecced functions
                 pending_batches = _get_pending_batches(all_batches, proj_dir)
                 if not pending_batches:
+                    incomplete_verification = _get_incomplete_verification_files(
+                        layer_files, input_dir, output_dir, work_dir
+                    )
+                    if incomplete_verification:
+                        logging.info(
+                            f"Phase {phase_num} Layer {layer_idx}: "
+                            f"{len(incomplete_verification)} ready file(s) still need verification or validation"
+                        )
+                        newly_processed = streaming_reasoner(
+                            input_dir, output_dir, file_list=layer_files,
+                            proj_dir=proj_dir, work_dir=work_dir,
+                            spec_procs=None,
+                            already_processed=all_processed | layer_processed,
+                            resume=resume,
+                        )
+                        layer_processed.update(newly_processed)
                     break
 
                 # Spawn concurrent opencode processes (one per pending batch)
@@ -564,6 +684,12 @@ def run_pipeline(proj_dir):
                     batch_file = batch_info["file"]
                     batch_prompt_rel = os.path.join(batch_rel_dir, batch_file)
                     batch_prompt_abs = os.path.join(proj_dir, batch_prompt_rel)
+                    # On resume a batch whose functions are all already specced
+                    # has no prompt file written and nothing for the agent to do
+                    # — skip it instead of sending an empty batch.
+                    if batch_info.get("num_pending", 1) == 0 or not os.path.exists(batch_prompt_abs):
+                        logging.info(f"Skipping batch with no functions to spec: {batch_file}")
+                        continue
                     function_files = batch_info.get("functions", [])
                     function_ids = [
                         function_id_from_extracted_path(func_rel)
@@ -620,7 +746,8 @@ def run_pipeline(proj_dir):
                 newly_processed = streaming_reasoner(input_dir, output_dir, file_list=layer_files,
                                    proj_dir=proj_dir, work_dir=work_dir,
                                    spec_procs=spec_procs,
-                                   already_processed=all_processed | layer_processed)
+                                   already_processed=all_processed | layer_processed,
+                                   resume=resume)
                 layer_processed.update(newly_processed)
 
                 for proc in spec_procs:
@@ -681,8 +808,19 @@ def run_pipeline(proj_dir):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="FM Agent pipeline.")
-    parser.add_argument("proj_dir", help="Path to the project directory.")
+    parser = argparse.ArgumentParser(
+        usage="python3 main.py <proj_dir> [--resume] [--incremental INTENT_FILE] "
+              "[--isolate] [--entry-func PATH] [--end-func PATH ...]",
+        description="Run the FM agent pipeline on a project directory.",
+    )
+    parser.add_argument("proj_dir", help="path to the project directory")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="continue a previous run in <proj_dir>/fm_agent instead of wiping it: "
+        "keeps phases.json, generated specs, and existing verification results; "
+        "only does the remaining work.",
+    )
     parser.add_argument(
         "--incremental",
         metavar="INTENT_FILE",
@@ -695,9 +833,40 @@ if __name__ == "__main__":
         help="Run the pipeline against an isolated git worktree snapshot of "
         "the project instead of the project directory itself.",
     )
+    parser.add_argument(
+        "--entry-func",
+        metavar="PATH",
+        default=None,
+        help="function path of the entry point to start reasoning from.",
+    )
+    parser.add_argument(
+        "--end-func",
+        metavar="PATH",
+        nargs="+",
+        default=None,
+        help="one or more function paths at which to stop (space-separated list); "
+        "if omitted, the whole call graph reachable from --entry-func is analyzed.",
+    )
     args = parser.parse_args()
 
+    resume = args.resume or os.environ.get("FM_AGENT_RESUME") == "1"
     proj_dir = os.path.abspath(args.proj_dir)
+
+    start_time = time.time()
+
+    # Entry-point mode: reason only about the call graph reachable from a specific
+    # entry function. Runs directly against the project directory (no worktree
+    # isolation or incremental diffing).
+    if args.entry_func is not None:
+        run_entry_pipeline(
+            proj_dir,
+            entry_func=args.entry_func,
+            end_funcs=args.end_func,
+            resume=resume,
+        )
+        end_time = time.time()
+        logging.info(f"Total time: {end_time - start_time:.2f} seconds")
+        sys.exit(0)
 
     # Incremental mode diffs against the commit recorded by a previous run, and
     # --isolate snapshots the repo via a git worktree, so both require a git repo.
@@ -728,7 +897,6 @@ if __name__ == "__main__":
     # snapshot commit, so the version to record must come from the real project.
     new_commit = _get_head_commit(proj_dir)
 
-    start_time = time.time()
     run_ctx = (
         frozen_worktree(proj_dir, copy_excluded=bool(args.incremental))
         if args.isolate
@@ -740,7 +908,7 @@ if __name__ == "__main__":
         if args.incremental and old_commit:
             run_incremental_pipeline(run_dir, intent_path, old_commit)
         else:
-            run_pipeline(run_dir)
+            run_pipeline(run_dir, resume=resume)
         # Record the commit that was processed. Written after the pipeline since it
         # recreates fm_agent/; with --isolate it lives in the snapshot and is copied
         # back to the real project below.

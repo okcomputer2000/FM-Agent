@@ -40,7 +40,7 @@ from .generate_batch_prompts import (
     extract_spec_block,
 )
 from .opencode_trace import run_opencode_traced
-from .llm_client import _openrouter_client, _llm_call
+from .llm_client import _llm_provider_client, _llm_call
 from .scope import _parse_issue_signals, rank_functions_in_file
 from .verification import _verify_single_file, _validate_single_bug, EXT_TO_LANG as _VERIFY_EXT_TO_LANG
 
@@ -825,7 +825,7 @@ def _llm_select_json(work_dir, prompt_content, stage, trace_meta=None):
     messages = [{"role": "user", "content": prompt_content}]
     meta = {"stage": stage, "summary": f"LLM {stage}", **(trace_meta or {})}
     raw = _llm_call(
-        _openrouter_client,
+        _llm_provider_client,
         LLM_MODEL,
         messages,
         "JSON",

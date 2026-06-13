@@ -14,7 +14,7 @@ from .trace_writer import (
     utc_now_iso,
 )
 
-_openrouter_client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_API_BASE_URL)
+_llm_provider_client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_API_BASE_URL)
 
 _MAX_RATE_LIMIT_RETRIES = 20
 _MAX_LLM_RETRIES = 5
@@ -166,6 +166,7 @@ def _retry_create(client, model, messages):
                     f"Rate limited after {_MAX_RATE_LIMIT_RETRIES} retries: {exc}"
                 ) from exc
             wait = min(2 ** (rate_limit_attempts - 1) * 5, 300) + random.uniform(1, 10)
+            logging.warning(f"LLM rate-limited, sleeping {wait:.1f}s (attempt {rate_limit_attempts})")
             time.sleep(wait)
         except Exception as exc:
             transient_attempts += 1
@@ -174,6 +175,9 @@ def _retry_create(client, model, messages):
                     f"LLM request failed after {_MAX_LLM_RETRIES} retries: {exc}"
                 ) from exc
             wait = min(2 ** (transient_attempts - 1) * 5, 60) + random.uniform(1, 3)
+            logging.warning(
+                f"LLM error ({type(exc).__name__}: {str(exc)[:120]}), "
+                f"sleeping {wait:.1f}s (attempt {transient_attempts})")
             time.sleep(wait)
 
 

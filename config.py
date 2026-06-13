@@ -24,6 +24,12 @@ OPENCODE_MAX_RETRIES = 5
 # the maximum number of bug-validation attempts per function is this value + 1.
 BUG_VALIDATION_MAX_RETRIES = int(os.environ.get("BUG_VALIDATION_MAX_RETRIES", "1"))
 
+# Hard cap on ONE `opencode run` subprocess. A model connection that dies
+# silently (e.g. through a forward proxy) otherwise hangs the pipeline forever —
+# opencode has no model-call timeout of its own. On expiry the child is killed
+# and the call raises CalledProcessError, which the callers' retry paths handle.
+OPENCODE_TIMEOUT_SECONDS = int(os.environ.get("OPENCODE_TIMEOUT_SECONDS", "1800"))
+
 # Function-selection scope knobs
 # Max number of functions retained per source file in the final scoped output.
 SCOPE_TOP_K = int(os.environ.get("SCOPE_TOP_K", "3"))

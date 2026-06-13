@@ -239,6 +239,12 @@ class State:
                     # OpenAI shape (svip compat path or older runs)
                     inp = usage.get("prompt_tokens", 0) or 0
                     out = usage.get("completion_tokens", 0) or 0
+                    # DeepSeek reports cache as flat fields; prompt_tokens is the
+                    # TOTAL (hit + miss). Split into disjoint in:new / in:read.
+                    hit = usage.get("prompt_cache_hit_tokens")
+                    if hit is not None:
+                        cr = hit
+                        inp = usage.get("prompt_cache_miss_tokens", inp - hit)
                 self.totals["input"] += inp
                 self.totals["output"] += out
                 self.totals["cache_read"] += cr
@@ -307,10 +313,19 @@ class State:
         if not (inp or out):
             return  # not a response payload
         self.opencode_calls += 1
-        cr = (usage.get("cache_read_input_tokens")
-              or _get_nested(usage, "prompt_tokens_details", "cached_tokens")
-              or _get_nested(usage, "input_tokens_details", "cached_tokens")
-              or 0)
+        # DeepSeek (openai-compat) reports cache as flat top-level fields, and
+        # prompt_tokens is the TOTAL (hit + miss). Split it into the disjoint
+        # in:new / in:read the rest of the dashboard assumes — otherwise the
+        # cached half is double-counted and the hit rate reads low.
+        hit = usage.get("prompt_cache_hit_tokens")
+        if hit is not None:
+            cr = hit
+            inp = usage.get("prompt_cache_miss_tokens", inp - hit)
+        else:
+            cr = (usage.get("cache_read_input_tokens")
+                  or _get_nested(usage, "prompt_tokens_details", "cached_tokens")
+                  or _get_nested(usage, "input_tokens_details", "cached_tokens")
+                  or 0)
         cw = (usage.get("cache_creation_input_tokens")
               or usage.get("claude_cache_creation_5_m_tokens")
               or 0)

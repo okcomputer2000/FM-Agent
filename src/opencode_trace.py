@@ -1,8 +1,10 @@
+import logging
 import os
 import subprocess
 import threading
 from dataclasses import dataclass
 
+from config import OPENCODE_TIMEOUT_SECONDS
 from .trace_writer import (
     new_event_id,
     record_trace_event,
@@ -202,7 +204,27 @@ def run_opencode_traced(
     log_thread = None
     try:
         proc, log_thread = _start_opencode_process(proj_dir, work_dir, event_id, command, opencode_log_path)
-        exit_code = proc.wait()
+        try:
+            exit_code = proc.wait(timeout=OPENCODE_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            # A model connection that dies silently (e.g. through a forward proxy)
+            # leaves opencode waiting forever — it has no model-call timeout of its
+            # own. Kill it and surface a CalledProcessError so the caller's retry
+            # path takes over instead of the whole pipeline hanging.
+            logging.warning(
+                "opencode %s timed out after %ds, killing: %s",
+                stage, OPENCODE_TIMEOUT_SECONDS, " ".join(command),
+            )
+            proc.terminate()
+            try:
+                exit_code = proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                exit_code = proc.wait()
+            if not exit_code:
+                exit_code = -15  # killed-on-timeout must never record as success
+            error = f"timeout after {OPENCODE_TIMEOUT_SECONDS}s"
+            raise subprocess.CalledProcessError(exit_code, command)
         if log_thread:
             log_thread.join()
         if exit_code != 0:
@@ -210,7 +232,7 @@ def run_opencode_traced(
         return subprocess.CompletedProcess(command, exit_code)
     except subprocess.CalledProcessError as exc:
         exit_code = exc.returncode
-        error = str(exc)
+        error = error or str(exc)
         raise
     finally:
         if log_thread and log_thread.is_alive():
