@@ -37,6 +37,15 @@ if [[ "$pip_major" -lt 23 ]]; then
     exit 1
 fi
 
+# ---------- uv ----------
+if command -v uv &>/dev/null; then
+    echo "[ok] uv found: $(uv --version)"
+else
+    echo "[..] installing uv"
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    export PATH="$HOME/.local/bin:$PATH"
+fi
+
 # ---------- Python packages ----------
 echo "[..] installing Python dependencies"
 python3 -m pip install openai
