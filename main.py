@@ -309,6 +309,63 @@ def _phases_cover_current_sources(phases_json, proj_dir):
     return _collect_project_source_files(proj_dir).issubset(listed)
 
 
+def _ensure_source_files_in_phases(phases_json, required_source_files):
+    """Force-list ``required_source_files`` in phases.json if the agent omitted them.
+
+    The Stage 2 setup agent decides which source files go into phases.json and may
+    leave out files that look like tests. When a caller (e.g. the entry pipeline)
+    must have a specific file processed regardless, this puts any missing ones
+    alone in a brand-new phase that becomes the earliest phase (number 1); every
+    pre-existing phase is shifted one slot later and its ``depends_on_phases``
+    references are renumbered to match. Returns the list of paths that had to be
+    added.
+    """
+    if not required_source_files:
+        return []
+
+    with open(phases_json, "r") as f:
+        data = json.load(f)
+
+    listed = set()
+    for phase in data.get("phases", []):
+        for module in phase.get("modules", []):
+            for sf in module.get("source_files", []):
+                listed.add(sf.replace("\\", "/"))
+
+    missing = [sf for sf in required_source_files if sf.replace("\\", "/") not in listed]
+    if not missing:
+        return []
+
+    existing = sorted(data.get("phases", []), key=lambda p: p.get("phase", 0))
+
+    # The new entry phase takes slot 1; existing phases shift to 2, 3, ... in
+    # their original relative order. Renumber depends_on_phases through the same map.
+    old_to_new = {p["phase"]: idx for idx, p in enumerate(existing, start=2) if "phase" in p}
+    for phase in existing:
+        if "phase" in phase:
+            phase["phase"] = old_to_new[phase["phase"]]
+        phase["depends_on_phases"] = [
+            old_to_new[dep] for dep in phase.get("depends_on_phases", []) if dep in old_to_new
+        ]
+
+    entry_phase = {
+        "phase": 1,
+        "name": "Entry Points",
+        "description": "Entry-point source files.",
+        "modules": [{
+            "name": "entry_points",
+            "description": "Entry-point source files.",
+            "source_files": list(missing),
+        }],
+        "depends_on_phases": [],
+    }
+    data["phases"] = [entry_phase] + existing
+
+    with open(phases_json, "w") as f:
+        json.dump(data, f, indent=2)
+    return missing
+
+
 def _run_setup_extract(proj_dir, work_dir, script_dir, is_incremental=False, resume=False):
     """Stage 2: prepare the setup workflow file and run opencode (with retries) to produce phases.json."""
     # On resume, reuse the existing phase plan instead of paying for the
@@ -519,7 +576,7 @@ def frozen_worktree(proj_dir, exclude=("fm_agent",), copy_excluded=True):
     yield wt
 
 
-def run_pipeline(proj_dir, resume=False):
+def run_pipeline(proj_dir, resume=False, required_source_files=None):
     if not os.path.isdir(proj_dir):
         print(f"[Pipeline] ERROR: proj_dir does not exist or is not a directory: {proj_dir}")
         sys.exit(1)
@@ -553,6 +610,15 @@ def run_pipeline(proj_dir, resume=False):
     # Copy workflow_setup_extract.md to proj_dir and run opencode against it
     print("[Pipeline] Stage 2/5: Understanding codebase and extracting functions ...")
     _run_setup_extract(proj_dir, work_dir, script_dir, resume=resume)
+
+    # The setup agent may have omitted required files (e.g. an entry point that
+    # looks like a test) from phases.json. Force them in before extraction so the
+    # caller's mandatory files are always processed.
+    forced = _ensure_source_files_in_phases(
+        os.path.join(work_dir, "phases.json"), required_source_files
+    )
+    if forced:
+        print(f"[Pipeline] Forced {len(forced)} required source file(s) into phases.json: {', '.join(forced)}")
 
     # Run function extraction using extract.py
     # force=False on resume preserves already-specced extracted files; on a fresh

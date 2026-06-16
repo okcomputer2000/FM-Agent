@@ -174,9 +174,29 @@ _TEST_FILE_PATTERNS = [
 ]
 
 
+# Project-relative paths that must never be treated as test files, even when
+# their path matches the heuristics below. The entry pipeline registers the
+# source file holding its entry_func here so that file is still extracted and
+# reasoned about even if it lives in a test directory or is named like a test.
+_TEST_FILE_EXEMPTIONS = set()
+
+
+def add_test_file_exemption(rel_path):
+    """Exempt a project-relative source path from the test-file heuristics."""
+    _TEST_FILE_EXEMPTIONS.add(rel_path.replace('\\', '/'))
+
+
+def clear_test_file_exemptions():
+    """Drop all registered test-file exemptions."""
+    _TEST_FILE_EXEMPTIONS.clear()
+
+
 def _is_test_file(rel_path):
     """Return True if the relative source path looks like a test file."""
-    parts = rel_path.replace('\\', '/').split('/')
+    norm_path = rel_path.replace('\\', '/')
+    if norm_path in _TEST_FILE_EXEMPTIONS:
+        return False
+    parts = norm_path.split('/')
     # Check if any directory component is a known test directory
     for part in parts[:-1]:
         if part.lower() in _TEST_DIR_NAMES:

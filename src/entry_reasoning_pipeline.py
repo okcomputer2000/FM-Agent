@@ -13,6 +13,8 @@ from src.extract import (
     _extract_functions_brace,
     _extract_functions_indent,
     _is_test_file,
+    add_test_file_exemption,
+    clear_test_file_exemptions,
     extract_functions_from_file,
 )
 import config
@@ -216,6 +218,18 @@ def _extracted_file_to_source_rel(extracted_rel):
     else:
         source_base = dir_name
     return os.path.join(src_dir, source_base) if src_dir else source_base
+
+
+def _entry_func_source_rel(entry_func):
+    """Map an entry_func FQN back to its source file (project-relative path).
+
+    ``src::engine::loader-cpp::loadData`` -> ``src/engine/loader.cpp``. The FQN's
+    last component is the function name and the second-to-last is the extraction
+    function directory (``loader-cpp``); reuse the extracted-file inverse mapping
+    by treating the ``::``-joined FQN as an extracted-file path.
+    """
+    extracted_rel = os.path.join(*entry_func.split("::"))
+    return _extracted_file_to_source_rel(extracted_rel).replace(os.sep, "/")
 
 
 def _group_funcs_by_source(extracted_filepaths, extracted_base):
@@ -490,6 +504,20 @@ def run_entry_pipeline(proj_dir, entry_func=None, end_funcs=None, resume=False):
     work_dir = os.path.join(proj_dir, "fm_agent")
     config.BUG_VALIDATION_MAX_RETRIES = 0
 
+    # The entry_func's source file may match the test-file heuristics (a test
+    # directory or test-like name). Exempt it so neither the selection extraction
+    # below nor run_pipeline's extraction skips it — the entry point must always
+    # be reasoned about. Cleared in the finally so the exemption never leaks into
+    # a later run in the same process.
+    add_test_file_exemption(_entry_func_source_rel(entry_func))
+    try:
+        _run_entry_pipeline_inner(proj_dir, work_dir, entry_func, end_funcs, resume)
+    finally:
+        clear_test_file_exemptions()
+
+
+def _run_entry_pipeline_inner(proj_dir, work_dir, entry_func, end_funcs, resume):
+    """Body of run_entry_pipeline; runs with the entry source file exempted."""
     # 1. Selection: extract fresh into a temp workspace and build the call graph.
     tmp_root = tempfile.mkdtemp(prefix="fm_entry_selection_")
     try:
@@ -539,7 +567,14 @@ def run_entry_pipeline(proj_dir, entry_func=None, end_funcs=None, resume=False):
         # run_entry_pipeline at module load).
         from main import run_pipeline
 
-        run_pipeline(proj_dir, resume=resume)
+        # Force the entry point's source file into phases.json even if the setup
+        # agent omits it (e.g. because it looks like a test), so run_pipeline
+        # always extracts and reasons about the entry function.
+        run_pipeline(
+            proj_dir,
+            resume=resume,
+            required_source_files=[_entry_func_source_rel(entry_func)],
+        )
     finally:
         # 4. restore the deleted functions/files; fm_agent/ stays untouched.
         _restore_sources(proj_dir, backup_dir)
