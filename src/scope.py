@@ -1,9 +1,13 @@
 """
-scope_functions.py — Function-level localization within scoped files.
+scope.py — Function-level localization within scoped files.
 
-Given a set of files already identified as relevant to a bug issue
-(from scope_result.json), this module narrows them down to the specific
-functions most likely to contain the fix.
+Given a set of files already identified as relevant to a developer intent
+(a feature request, change description, or bug report), this module narrows
+them down to the specific functions most likely to need changing. It is
+driven in-memory by incremental_reasoner.collect_relevent_function_scope:
+rank_functions_in_file returns the ranked functions directly (no JSON file
+is read or written here). Throughout this module the `issue` parameter is
+that developer-intent text.
 
 Language support: Python files are parsed with the `ast` module (richest signal
 extraction). Every other language with an extension registered in extract.EXT_TO_LANG
@@ -14,27 +18,28 @@ recovered by regex (class-scope narrowing is Python-only).
 Pipeline
 --------
 Stage 1 – Heuristic scoring  (always runs, no LLM cost)
-    Five signal tiers extracted from the issue text, in decreasing weight:
+    Signal tiers extracted from the intent text, in decreasing weight:
         T1  Traceback function names ("  in func_name")            ×10
         T2  Backtick / code-block identifiers                     ×5 (name), ×2 (body)
-        T3  Explicit Class.method dotted references               ×15 (NEW)
+        T3  Explicit Class.method dotted references               ×15
         T4  CamelCase / snake_case identifiers in prose           ×3
-        T5  Exception type matching (raise/except in body)        ×4 (NEW)
+        T5  Exception type matching (raise/except in body)        ×4
         T6  Body word overlap, normalised by √(lines)             ×1
 
     Post-scoring enrichments:
         • Intra-file call-graph propagation (callee ×0.30, caller ×0.20)
-        • Class-scope narrowing (NEW): score classes by name/docstring
-          overlap with issue, then boost all methods of top-matching classes
+        • Class-scope narrowing: score classes by name/docstring overlap
+          with the intent, then boost all methods of top-matching classes
 
 Stage 2 – LLM re-ranking  (optional, triggered when file has ≥ LLM_TRIGGER_FUNCS
     unique functions after dedup, or heuristic top score < confidence threshold)
     Sends only function signatures + first docstring line; no bodies.
     Falls back to heuristic on failure.
 
-Output: scope_functions.json
-    {"functions": [{"file": "...", "name": "...", "lineno": N,
-                    "end_lineno": M, "score": 12.4, "reason": "heuristic"}]}
+Returns (rank_functions_in_file): a list of dicts, one per selected function,
+sorted by descending score:
+    {"file": "...", "name": "...", "lineno": N, "end_lineno": M,
+     "score": 12.4, "reason": "heuristic"}
 """
 
 from __future__ import annotations
@@ -89,9 +94,9 @@ FUZZY_NAME_THRESHOLD = 0.75
 CALLEE_INHERIT = 0.30
 CALLER_INHERIT = 0.20
 
-# Class-scope narrowing (NEW)
-W_CLASS_NAME_MATCH   = 6.0  # per overlapping token between class name and issue
-W_CLASS_DOC_MATCH    = 2.0  # per overlapping token between class docstring and issue
+# Class-scope narrowing
+W_CLASS_NAME_MATCH   = 6.0  # per overlapping token between class name and intent
+W_CLASS_DOC_MATCH    = 2.0  # per overlapping token between class docstring and intent
 # Class method inheritance: cap so a single high-scoring class doesn't flood top slots.
 # Absolute cap: per-method bonus ≤ CLASS_BOOST_CAP regardless of class score.
 CLASS_METHOD_INHERIT = 0.40 # fraction of class score passed to every method
@@ -151,14 +156,14 @@ _STOP = frozenset({
 # ── signal extraction ───────────────────────────────────────────────────────
 
 def _parse_issue_signals(issue_text: str) -> dict[str, set[str]]:
-    """Extract multiple tiers of signals from the raw issue text."""
+    """Extract multiple tiers of signals from the raw developer-intent text."""
     signals: dict[str, set[str]] = {
         'traceback_funcs': set(),
         'backtick_idents': set(),
-        'dotted_refs':     set(),   # NEW: (class_lower, method_lower) flattened
-        'dotted_classes':  set(),   # NEW: class names from Class.method refs
+        'dotted_refs':     set(),   # method names from Class.method refs
+        'dotted_classes':  set(),   # class names from Class.method refs
         'plain_idents':    set(),
-        'exception_types': set(),   # NEW: ExcType from issue
+        'exception_types': set(),   # exception type names mentioned in the intent
         'all_words':       set(),
     }
 
@@ -168,7 +173,7 @@ def _parse_issue_signals(issue_text: str) -> dict[str, set[str]]:
     # T2: identifiers inside backticks or fenced code blocks
     signals['backtick_idents'] = _extract_backtick_idents(issue_text)
 
-    # T3 (NEW): explicit Class.method dotted references
+    # T3: explicit Class.method dotted references
     for cls, meth in re.findall(r'\b([A-Z][a-zA-Z0-9]+)\.([a-z_][a-z0-9_]+)\b',
                                 issue_text):
         signals['dotted_refs'].add(meth.lower())
@@ -186,7 +191,7 @@ def _parse_issue_signals(issue_text: str) -> dict[str, set[str]]:
             if len(part) > 2:
                 signals['plain_idents'].add(part)
 
-    # T5 (NEW): exception types  (e.g. AssertionError, ImportError)
+    # T5: exception types  (e.g. AssertionError, ImportError)
     for exc in re.findall(r'\b([A-Z][a-zA-Z]+(?:Error|Exception|Warning))\b',
                           issue_text):
         signals['exception_types'].add(exc.lower())
@@ -278,7 +283,7 @@ def _collect_func_idents(node: ast.FunctionDef | ast.AsyncFunctionDef,
         elif isinstance(n, ast.Constant) and isinstance(n.value, str):
             for w in re.findall(r'[a-zA-Z_][a-zA-Z0-9_]{2,}', n.value):
                 idents.add(w.lower())
-        # NEW: collect raised exception types
+        # collect raised exception types
         elif isinstance(n, ast.Raise):
             if n.exc:
                 exc_node = n.exc
@@ -288,7 +293,7 @@ def _collect_func_idents(node: ast.FunctionDef | ast.AsyncFunctionDef,
                     exc_types.add(exc_node.id.lower())
                 elif isinstance(exc_node, ast.Attribute):
                     exc_types.add(exc_node.attr.lower())
-        # NEW: collect caught exception types
+        # collect caught exception types
         elif isinstance(n, ast.ExceptHandler) and n.type:
             exc_node = n.type
             if isinstance(exc_node, ast.Name):
@@ -314,7 +319,7 @@ def _collect_calls(node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
     return calls
 
 
-# ── class-scope extraction (NEW) ─────────────────────────────────────────────
+# ── class-scope extraction ───────────────────────────────────────────────────
 
 def _extract_classes(tree: ast.Module,
                      source_lines: list[str]) -> list[dict]:
@@ -342,7 +347,7 @@ def _extract_classes(tree: ast.Module,
 
 
 def _score_class(cls: dict, signals: dict[str, set[str]]) -> float:
-    """Score a class by how well it matches the issue signals."""
+    """Score a class by how well it matches the developer-intent signals."""
     score = 0.0
     name_parts = _name_parts(cls['name'])
 
@@ -387,13 +392,13 @@ def _base_score(name: str,
     # T2b: body idents overlap with backtick idents
     score += len(idents & signals['backtick_idents']) * W_BACKTICK_BODY
 
-    # T3 (NEW): name or parts in dotted refs (Class.method)
+    # T3: name or parts in dotted refs (Class.method)
     score += len(parts & signals['dotted_refs']) * W_DOTTED_REF
 
     # T4: name in plain idents
     score += len(parts & signals['plain_idents']) * W_PLAIN_NAME
 
-    # T4b: function name parts overlap with issue prose words (all_words)
+    # T4b: function name parts overlap with intent prose words (all_words)
     # Only count words ≥5 chars to avoid noise from short structural words
     # like 'add', 'join', 'inline', 'block' that appear in many function names.
     specific_name_words = {p for p in parts if len(p) >= 5}
@@ -403,7 +408,7 @@ def _base_score(name: str,
     # Keep this name-only and low-weight so broad body prose cannot dominate scope.
     score += _fuzzy_name_score(parts, signals)
 
-    # T5 (NEW): exception type match
+    # T5: exception type match
     if signals['exception_types'] and exc_types:
         score += len(signals['exception_types'] & exc_types) * W_EXCEPTION_MATCH
 
@@ -473,15 +478,16 @@ def _rank_functions(funcs_info: list[dict],
 
 _LLM_SYSTEM = (
     "You are a precise code-analysis assistant. "
-    "Given a bug issue and a list of functions from a single source file, "
-    "identify the functions most likely to need modification to fix the bug. "
+    "Given a developer intent (a feature request, change description, or bug "
+    "report) and a list of functions from a single source file, "
+    "identify the functions most likely to need modification to satisfy it. "
     "You must output ONLY a JSON array of function names, e.g.: "
     '["load_disk", "migrations_module"]. '
     "Output ONLY the JSON array and nothing else."
 )
 
 _LLM_USER_TMPL = """\
-## Issue
+## Developer intent
 {issue}
 
 ## File: {filepath}
