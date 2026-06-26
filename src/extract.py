@@ -747,7 +747,7 @@ def run_extraction(proj_dir, work_dir=None, force=False, verbose=False):
         return written, skipped
 
     # --- Validation (Step 2) ---
-    validation_failures = _validate_extraction(output_base)
+    validation_failures = _validate_extraction(output_base, cg=_cg)
     if validation_failures:
         logging.warning(
             f"Validation: {len(validation_failures)} file(s) do not contain exactly one function."
@@ -766,17 +766,26 @@ def run_extraction(proj_dir, work_dir=None, force=False, verbose=False):
     return written, skipped
 
 
-def _validate_extraction(extracted_dir):
+def _validate_extraction(extracted_dir, cg=None):
     """Re-parse every extracted file and verify each contains exactly one function.
+
+    When cg is provided, files for codegraph-supported languages are skipped:
+    codegraph writes exactly one function body per file by construction (one DB
+    node → one line-range slice → one write), so regex re-parsing adds no safety
+    and produces false negatives for forms the regex cannot recognise (async def,
+    class methods, arrow functions).
 
     Returns a list of (file_path, function_count) for files that fail validation.
     """
+    from src.extractors.codegraph import CODEGRAPH_SUPPORTED
     failures = []
     for root, _, files in os.walk(extracted_dir):
         for fname in files:
             ext = fname.rsplit('.', 1)[-1] if '.' in fname else ''
             lang_key = EXT_TO_LANG.get(ext)
             if not lang_key:
+                continue
+            if cg and lang_key in CODEGRAPH_SUPPORTED:
                 continue
             fpath = os.path.join(root, fname)
             funcs = extract_functions_from_file(fpath, lang_key)
