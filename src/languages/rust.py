@@ -6,8 +6,10 @@ if TYPE_CHECKING:
 
 
 def batch_extract(cg: "CodeGraphExtractor", proj_dir: str) -> dict:
+    """Return {abs_filepath: [(func_name, body)]} for all Rust files."""
     return cg.get_functions_by_file("rust", proj_dir)
 
 
 def call_edges(cg: "CodeGraphExtractor") -> dict:
+    """Return {(caller_stem, caller_basename): {callee_stems}} for Rust."""
     return cg.get_call_edges("rust")
