@@ -6,6 +6,7 @@ from pathlib import Path
 from collections import defaultdict
 
 from src.extract import EXT_TO_LANG, LANG_CONFIG
+from src.languages.codegraph import CodeGraphExtractor, CODEGRAPH_SUPPORTED
 
 
 # ---------------------------------------------------------------------------
@@ -304,7 +305,6 @@ def _build_call_graph(phase_files, proj_dir, global_stem_to_fqns=None):
     # Try codegraph backend for call edges; merge all supported languages.
     # Falls back to regex scanning per-file when unavailable or language not
     # yet in CODEGRAPH_SUPPORTED.
-    from src.extractors.codegraph import CodeGraphExtractor, CODEGRAPH_SUPPORTED
     _cg = CodeGraphExtractor.from_proj_dir(proj_dir)
     _cg_edges = {}  # {(caller_stem, caller_basename): {callee_stem}}
     if _cg:

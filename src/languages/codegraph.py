@@ -8,8 +8,10 @@ To add support for a new language: add its FM-Agent lang_key to CODEGRAPH_SUPPOR
 No other changes are needed in extract.py or generate_topdown_layers.py.
 """
 
+import logging
 import os
 import sqlite3
+import subprocess
 from collections import defaultdict
 
 # Languages currently routed through the codegraph backend.
@@ -141,3 +143,28 @@ class CodeGraphExtractor:
             key = (caller, os.path.basename(caller_file))
             result[key].add(callee)
         return dict(result)
+
+
+def try_codegraph_init(proj_dir: str) -> None:
+    """Run `codegraph init` in proj_dir if the index does not yet exist.
+
+    Silently skips when codegraph is not installed so the pipeline falls back
+    to the regex-based extractor without any error.
+    """
+    db_path = os.path.join(proj_dir, ".codegraph", "codegraph.db")
+    if os.path.exists(db_path):
+        return
+    print("[Pipeline] Building codegraph index (this runs once per project)...")
+    try:
+        result = subprocess.run(
+            ["codegraph", "init"], cwd=proj_dir, capture_output=True, text=True
+        )
+    except FileNotFoundError:
+        return  # codegraph not installed
+    if result.returncode == 0:
+        print("[Pipeline] codegraph index built.")
+    else:
+        logging.warning(
+            "codegraph init failed (non-fatal, falling back to regex): %s",
+            result.stderr[:300],
+        )

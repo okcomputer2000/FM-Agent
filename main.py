@@ -16,6 +16,7 @@ from src.opencode_trace import (
     start_opencode_traced,
 )
 from src.incremental_reasoner import run_incremental_pipeline
+from src.languages.codegraph import try_codegraph_init
 import os
 import sys
 import argparse
@@ -130,27 +131,6 @@ def _get_phase_files(phases_data, phase_num, input_dir):
                         phase_files.append(os.path.relpath(fpath, input_dir))
     return phase_files
 
-
-def _try_codegraph_init(proj_dir):
-    """Run `codegraph init` in proj_dir if codegraph is installed and the index
-    does not yet exist. Silently skips when codegraph is not installed so that
-    the pipeline falls back to the regex-based extractor without any error."""
-    db_path = os.path.join(proj_dir, ".codegraph", "codegraph.db")
-    if os.path.exists(db_path):
-        return
-    try:
-        subprocess.run(["codegraph", "--version"], capture_output=True, check=True)
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return
-    print("[Pipeline] Building codegraph index (this runs once per project)...")
-    result = subprocess.run(
-        ["codegraph", "init"], cwd=proj_dir, capture_output=True, text=True
-    )
-    if result.returncode == 0:
-        print("[Pipeline] codegraph index built.")
-    else:
-        logging.warning("codegraph init failed (non-fatal, falling back to regex): %s",
-                        result.stderr[:300])
 
 
 def _clean_previous_run(work_dir):
@@ -625,7 +605,7 @@ def run_pipeline(proj_dir, resume=False, required_source_files=None):
     # Build codegraph index if codegraph is installed and index not yet present.
     # Both run_extraction (Stage 2) and generate_topdown_layers (Stage 3) will
     # automatically use the index when it exists.
-    _try_codegraph_init(proj_dir)
+    try_codegraph_init(proj_dir)
 
     # Run function extraction using extract.py
     # force=False on resume preserves already-specced extracted files; on a fresh

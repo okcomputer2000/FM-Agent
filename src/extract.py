@@ -6,6 +6,7 @@ import shutil
 import logging
 
 from src.file_utils import is_file_ready
+from src.languages.codegraph import CodeGraphExtractor, CODEGRAPH_SUPPORTED
 
 LANG_CONFIG = {
     "cpp": {
@@ -666,7 +667,6 @@ def run_extraction(proj_dir, work_dir=None, force=False, verbose=False):
     # Try codegraph backend; pre-fetch all functions indexed by abs filepath.
     # Falls back to regex extraction per-file when codegraph is unavailable or
     # the language is not yet in CODEGRAPH_SUPPORTED.
-    from src.extractors.codegraph import CodeGraphExtractor, CODEGRAPH_SUPPORTED
     _cg = CodeGraphExtractor.from_proj_dir(proj_dir)
     _cg_funcs = {}  # {abs_filepath: [(name, body)]}
     if _cg:
@@ -777,7 +777,6 @@ def _validate_extraction(extracted_dir, cg=None):
 
     Returns a list of (file_path, function_count) for files that fail validation.
     """
-    from src.extractors.codegraph import CODEGRAPH_SUPPORTED
     failures = []
     for root, _, files in os.walk(extracted_dir):
         for fname in files:
