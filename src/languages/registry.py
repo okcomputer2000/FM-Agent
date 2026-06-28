@@ -2,6 +2,13 @@ from dataclasses import dataclass
 from typing import Callable
 
 from src.languages import python as _python
+from src.languages import go as _go
+from src.languages import c as _c
+from src.languages import cpp as _cpp
+from src.languages import java as _java
+from src.languages import rust as _rust
+from src.languages import javascript as _javascript
+from src.languages import typescript as _typescript
 
 
 @dataclass
@@ -24,10 +31,14 @@ class LanguageHandler:
 
 
 REGISTRY: dict = {
-    "python": LanguageHandler(
-        batch_extract=_python.batch_extract,
-        call_edges=_python.call_edges,
-    ),
+    "python":     LanguageHandler(batch_extract=_python.batch_extract,     call_edges=_python.call_edges),
+    "go":         LanguageHandler(batch_extract=_go.batch_extract,         call_edges=_go.call_edges),
+    "c":          LanguageHandler(batch_extract=_c.batch_extract,          call_edges=_c.call_edges),
+    "cpp":        LanguageHandler(batch_extract=_cpp.batch_extract,        call_edges=_cpp.call_edges),
+    "java":       LanguageHandler(batch_extract=_java.batch_extract,       call_edges=_java.call_edges),
+    "rust":       LanguageHandler(batch_extract=_rust.batch_extract,       call_edges=_rust.call_edges),
+    "javascript": LanguageHandler(batch_extract=_javascript.batch_extract, call_edges=_javascript.call_edges),
+    "typescript": LanguageHandler(batch_extract=_typescript.batch_extract, call_edges=_typescript.call_edges),
 }
 
 
