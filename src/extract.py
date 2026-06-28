@@ -6,6 +6,7 @@ import shutil
 import logging
 
 from src.file_utils import is_file_ready
+from src.languages.registry import batch_extract_all
 
 LANG_CONFIG = {
     "cpp": {
@@ -663,6 +664,8 @@ def run_extraction(proj_dir, work_dir=None, force=False, verbose=False):
     with open(phases_path, 'r') as f:
         phases_data = json.load(f)
 
+    registry_funcs, registry_langs = batch_extract_all(proj_dir)
+
     # Build source file list from phases.json
     source_files = []
     for phase in phases_data.get("phases", []):
@@ -704,7 +707,10 @@ def run_extraction(proj_dir, work_dir=None, force=False, verbose=False):
             dir_name = src_base
         out_dir = os.path.join(output_base, src_dir, dir_name) if src_dir else os.path.join(output_base, dir_name)
 
-        funcs = extract_functions_from_file(src_path, lang_key)
+        if src_path in registry_funcs:
+            funcs = registry_funcs[src_path]
+        else:
+            funcs = extract_functions_from_file(src_path, lang_key)
         if not funcs:
             logging.warning(f"No functions extracted from {src_rel}")
             continue
@@ -734,7 +740,7 @@ def run_extraction(proj_dir, work_dir=None, force=False, verbose=False):
         return written, skipped
 
     # --- Validation (Step 2) ---
-    validation_failures = _validate_extraction(output_base)
+    validation_failures = _validate_extraction(output_base, registry_langs=registry_langs)
     if validation_failures:
         logging.warning(
             f"Validation: {len(validation_failures)} file(s) do not contain exactly one function."
@@ -753,8 +759,13 @@ def run_extraction(proj_dir, work_dir=None, force=False, verbose=False):
     return written, skipped
 
 
-def _validate_extraction(extracted_dir):
+def _validate_extraction(extracted_dir, registry_langs=None):
     """Re-parse every extracted file and verify each contains exactly one function.
+
+    Files for languages that returned data from their REGISTRY backend are skipped:
+    those backends write exactly one function body per file by construction, so
+    regex re-parsing adds no safety and produces false negatives for forms the
+    regex cannot recognise (async def, class methods, arrow functions).
 
     Returns a list of (file_path, function_count) for files that fail validation.
     """
@@ -764,6 +775,8 @@ def _validate_extraction(extracted_dir):
             ext = fname.rsplit('.', 1)[-1] if '.' in fname else ''
             lang_key = EXT_TO_LANG.get(ext)
             if not lang_key:
+                continue
+            if registry_langs and lang_key in registry_langs:
                 continue
             fpath = os.path.join(root, fname)
             funcs = extract_functions_from_file(fpath, lang_key)

@@ -6,6 +6,7 @@ from pathlib import Path
 from collections import defaultdict
 
 from src.extract import EXT_TO_LANG, LANG_CONFIG
+from src.languages.registry import call_edges_all
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +286,9 @@ def _build_call_graph(phase_files, proj_dir, global_stem_to_fqns=None):
     callers_map = defaultdict(set)  # fqn -> set of caller fqns (within phase)
     all_callees_map = defaultdict(set)  # fqn -> set of callee fqns (any phase)
 
+    phase_langs = {_detect_lang_from_ext(fp) for fp, _ in phase_files if _detect_lang_from_ext(fp)}
+    registry_edges, registry_langs = call_edges_all(proj_dir, phase_langs)
+
     for filepath, module_name in phase_files:
         fqn = fqn_map[filepath]
         lang_key = _detect_lang_from_ext(filepath)
@@ -292,13 +296,17 @@ def _build_call_graph(phase_files, proj_dir, global_stem_to_fqns=None):
             continue
         keywords = _get_keywords_for_lang(lang_key)
 
-        try:
-            with open(filepath, "r", errors="replace") as f:
-                text = f.read()
-        except OSError:
-            continue
-
-        called_stems = _find_call_sites(text, lang_key, known_stems, keywords)
+        caller_stem = fqn.split("::")[-1]
+        if lang_key in registry_langs:
+            caller_module = fqn.split("::")[-2]
+            called_stems = registry_edges.get((caller_stem, caller_module), set()) & known_stems
+        else:
+            try:
+                with open(filepath, "r", errors="replace") as f:
+                    text = f.read()
+            except OSError:
+                continue
+            called_stems = _find_call_sites(text, lang_key, known_stems, keywords)
 
         # Resolve stems to FQNs, excluding self
         for stem in called_stems:
