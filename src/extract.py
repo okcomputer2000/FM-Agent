@@ -664,7 +664,7 @@ def run_extraction(proj_dir, work_dir=None, force=False, verbose=False):
     with open(phases_path, 'r') as f:
         phases_data = json.load(f)
 
-    backend_funcs, backend_langs = batch_extract_all(proj_dir)
+    registry_funcs, registry_langs = batch_extract_all(proj_dir)
 
     # Build source file list from phases.json
     source_files = []
@@ -707,8 +707,8 @@ def run_extraction(proj_dir, work_dir=None, force=False, verbose=False):
             dir_name = src_base
         out_dir = os.path.join(output_base, src_dir, dir_name) if src_dir else os.path.join(output_base, dir_name)
 
-        if src_path in backend_funcs:
-            funcs = backend_funcs[src_path]
+        if src_path in registry_funcs:
+            funcs = registry_funcs[src_path]
         else:
             funcs = extract_functions_from_file(src_path, lang_key)
         if not funcs:
@@ -740,7 +740,7 @@ def run_extraction(proj_dir, work_dir=None, force=False, verbose=False):
         return written, skipped
 
     # --- Validation (Step 2) ---
-    validation_failures = _validate_extraction(output_base, backend_langs=backend_langs)
+    validation_failures = _validate_extraction(output_base, registry_langs=registry_langs)
     if validation_failures:
         logging.warning(
             f"Validation: {len(validation_failures)} file(s) do not contain exactly one function."
@@ -759,7 +759,7 @@ def run_extraction(proj_dir, work_dir=None, force=False, verbose=False):
     return written, skipped
 
 
-def _validate_extraction(extracted_dir, backend_langs=None):
+def _validate_extraction(extracted_dir, registry_langs=None):
     """Re-parse every extracted file and verify each contains exactly one function.
 
     Files for languages that returned data from their REGISTRY backend are skipped:
@@ -776,7 +776,7 @@ def _validate_extraction(extracted_dir, backend_langs=None):
             lang_key = EXT_TO_LANG.get(ext)
             if not lang_key:
                 continue
-            if backend_langs and lang_key in backend_langs:
+            if registry_langs and lang_key in registry_langs:
                 continue
             fpath = os.path.join(root, fname)
             funcs = extract_functions_from_file(fpath, lang_key)

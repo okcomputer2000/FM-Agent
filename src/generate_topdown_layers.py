@@ -287,7 +287,7 @@ def _build_call_graph(phase_files, proj_dir, global_stem_to_fqns=None):
     all_callees_map = defaultdict(set)  # fqn -> set of callee fqns (any phase)
 
     phase_langs = {_detect_lang_from_ext(fp) for fp, _ in phase_files if _detect_lang_from_ext(fp)}
-    backend_edges, backend_langs = call_edges_all(proj_dir, phase_langs)
+    registry_edges, registry_langs = call_edges_all(proj_dir, phase_langs)
 
     for filepath, module_name in phase_files:
         fqn = fqn_map[filepath]
@@ -297,9 +297,9 @@ def _build_call_graph(phase_files, proj_dir, global_stem_to_fqns=None):
         keywords = _get_keywords_for_lang(lang_key)
 
         caller_stem = fqn.split("::")[-1]
-        if lang_key in backend_langs:
+        if lang_key in registry_langs:
             caller_module = fqn.split("::")[-2]
-            called_stems = backend_edges.get((caller_stem, caller_module), set()) & known_stems
+            called_stems = registry_edges.get((caller_stem, caller_module), set()) & known_stems
         else:
             try:
                 with open(filepath, "r", errors="replace") as f:
