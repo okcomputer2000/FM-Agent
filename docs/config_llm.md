@@ -23,6 +23,10 @@ model calls:
 - Codex sessions use `codex exec` with full filesystem access, plus `--model "$LLM_MODEL"` when set and `model_reasoning_effort="$LLM_EFFORT"` when non-empty.
 - Claude Code sessions use `claude -p --dangerously-skip-permissions`, plus `--model "$LLM_MODEL"` when set and `--effort "$LLM_EFFORT"` when non-empty.
 
+The following versions have been tested
+- Claude Code >= 2.1.195
+- Codex >= 0.140.0
+
 Leave `LLM_EFFORT` empty to use the selected CLI's default effort behavior.
 Set it only to a value accepted by the selected CLI and model.
 
