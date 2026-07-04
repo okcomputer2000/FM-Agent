@@ -62,8 +62,9 @@ The [website](http://fm-agent.ai/) of FM-Agent provides an online service for re
 - [@lucentia/opencode-trace](https://www.npmjs.com/package/@lucentia/opencode-trace) plugin — captures raw OpenCode LLM request/response traces (see [Structured Trace](#structured-trace))
 - An LLM API key for your provider (the examples use [OpenRouter](https://openrouter.ai/))
 - [Erlang Language Platform (ELP)](https://whatsapp.github.io/erlang-language-platform/docs/get-started/) — optional; required only when analyzing Erlang projects
-  - Erlang/OTP 26 or newer is recommended and is the supported configuration for this integration; select an ELP release binary built for a compatible OTP version.
+  - The Erlang integration has been tested on Ubuntu with Erlang/OTP 26 or newer; select an ELP release binary built for a compatible OTP version.
   - rebar3 3.24.0 or newer is required for ELP to auto-discover projects containing `rebar.config`.
+  - The macOS Erlang toolchain has not been tested as part of this integration; `./install.sh --with-erlang` installs the current Homebrew formula versions.
 
 #### Tested macOS Environment
 
@@ -108,7 +109,13 @@ Then, all of the above dependencies (except Ubuntu and Python) can be installed 
 ./install.sh
 ```
 
-The install script does not install Erlang/OTP, rebar3, or ELP. To analyze Erlang, use Erlang/OTP 26 or newer, install rebar3 3.24.0 or newer, install a compatible ELP release, ensure both `rebar3 version` and `elp version` succeed, and keep `ELP_COMMAND=elp` (or set it to the absolute binary path). Other languages do not require these dependencies.
+Erlang support is optional because its toolchain is not needed for other languages. To install or verify Erlang/OTP 26+, rebar3 3.24.0+, and a compatible ELP release automatically, run:
+
+```bash
+./install.sh --with-erlang
+```
+
+The Erlang option uses Homebrew on macOS and the RabbitMQ Team Erlang PPA on Ubuntu when the system OTP is missing or too old. The Ubuntu configuration has been tested with Erlang/OTP 26+; the macOS Erlang configuration has not been tested and uses the current formula versions selected by Homebrew. On Linux, rebar3 and ELP are installed into `~/.local/bin`; ensure this directory is on `PATH` in new shells. You can still install these tools manually, verify `rebar3 version` and `elp version`, and set `ELP_COMMAND` to an absolute ELP path if needed.
 
 (Optional) If needed, you can manually set the default LLM model and API key of OpenCode in its configuration file.
 
