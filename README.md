@@ -62,6 +62,8 @@ The [website](http://fm-agent.ai/) of FM-Agent provides an online service for re
 - [@lucentia/opencode-trace](https://www.npmjs.com/package/@lucentia/opencode-trace) plugin — captures raw OpenCode LLM request/response traces (see [Structured Trace](#structured-trace))
 - An LLM API key for your provider (the examples use [OpenRouter](https://openrouter.ai/))
 - [Erlang Language Platform (ELP)](https://whatsapp.github.io/erlang-language-platform/docs/get-started/) — optional; required only when analyzing Erlang projects
+  - Erlang/OTP 26 or newer is recommended and is the supported configuration for this integration; select an ELP release binary built for a compatible OTP version.
+  - rebar3 3.24.0 or newer is required for ELP to auto-discover projects containing `rebar.config`.
 
 #### Tested macOS Environment
 
@@ -106,7 +108,7 @@ Then, all of the above dependencies (except Ubuntu and Python) can be installed 
 ./install.sh
 ```
 
-The install script does not install ELP. To analyze Erlang, install ELP separately, ensure `elp version` succeeds, and keep `ELP_COMMAND=elp` (or set it to the absolute binary path). Other languages do not require ELP.
+The install script does not install Erlang/OTP, rebar3, or ELP. To analyze Erlang, use Erlang/OTP 26 or newer, install rebar3 3.24.0 or newer, install a compatible ELP release, ensure both `rebar3 version` and `elp version` succeed, and keep `ELP_COMMAND=elp` (or set it to the absolute binary path). Other languages do not require these dependencies.
 
 (Optional) If needed, you can manually set the default LLM model and API key of OpenCode in its configuration file.
 

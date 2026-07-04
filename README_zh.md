@@ -61,6 +61,8 @@ FM-Agent 的[官方网站](http://fm-agent.ai/)提供了在线代码库推理服
 - [@lucentia/opencode-trace](https://www.npmjs.com/package/@lucentia/opencode-trace) 插件 —— 采集 OpenCode 原始 LLM 请求/响应 trace
 - 你所用 provider 的 LLM API 密钥（示例使用 [OpenRouter](https://openrouter.ai/)）
 - [Erlang Language Platform（ELP）](https://whatsapp.github.io/erlang-language-platform/docs/get-started/)——可选，仅分析 Erlang 项目时需要
+  - 推荐使用 Erlang/OTP 26 或更高版本，这也是本集成支持并验证的配置；请选择基于兼容 OTP 版本构建的 ELP 发布包。
+  - ELP 自动识别包含 `rebar.config` 的项目时，要求 rebar3 3.24.0 或更高版本。
 
 #### 已测试macOS环境
 
@@ -105,7 +107,7 @@ OpenCode provider 的配置以及可选的 prompt 缓存设置见 [docs/config_l
 ./install.sh
 ```
 
-安装脚本不会安装 ELP。如需分析 Erlang，请单独安装 ELP，确认 `elp version` 可用，并保留 `ELP_COMMAND=elp`（或设置为二进制文件的绝对路径）。其他语言不依赖 ELP。
+安装脚本不会安装 Erlang/OTP、rebar3 或 ELP。如需分析 Erlang，请使用 Erlang/OTP 26 或更高版本，安装 rebar3 3.24.0 或更高版本以及兼容的 ELP 发布包，确认 `rebar3 version` 和 `elp version` 均可正常执行，并保留 `ELP_COMMAND=elp`（或设置为二进制文件的绝对路径）。其他语言不依赖这些组件。
 
 （可选）如有需要，可在 OpenCode 的配置文件中手动设置默认 LLM 模型和 API 密钥。
 
