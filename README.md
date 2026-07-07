@@ -21,6 +21,7 @@ The [website](http://fm-agent.ai/) of FM-Agent provides an online service for re
 
 ## Table of Contents
 
+- [FM-Agent: Scaling Formal Methods to Large Systems via LLM-Based Hoare-Style Reasoning](#fm-agent-scaling-formal-methods-to-large-systems-via-llm-based-hoare-style-reasoning)
   - [Table of Contents](#table-of-contents)
   - [File Structure](#file-structure)
   - [Environment Setup](#environment-setup)
@@ -28,7 +29,12 @@ The [website](http://fm-agent.ai/) of FM-Agent provides an online service for re
       - [Tested macOS Environment](#tested-macos-environment)
     - [Install Dependencies](#install-dependencies)
   - [Configuration](#configuration)
+    - [Structured Trace](#structured-trace)
   - [Quick Start](#quick-start)
+    - [Incremental Mode](#incremental-mode)
+    - [Live Dashboard](#live-dashboard)
+    - [Output](#output)
+      - [Bug Reports (`fm_agent/bug_validation/<bug_id>.md`)](#bug-reports-fm_agentbug_validationbug_idmd)
   - [Important Notes](#important-notes)
   - [Citation](#citation)
   - [Contact](#contact)
@@ -176,17 +182,16 @@ uv run python main.py <proj_dir> [--resume]
 | `--resume`                  | Continue a previous, interrupted run instead of starting over                                   |
 | `--incremental INTENT_FILE` | Run in incremental mode. The value is the path to an intent file describing the goal of the modification. |
 | `--isolate`                 | Run against an isolated git worktree snapshot of the project instead of the project directory itself. |
-| `--extra-edge FILE`         | Add supplemental caller-to-callee edges to the static call graph. Defaults to `<proj_dir>/docs/extra-edge` when that path exists. Supports `fm-agent-extra-edges-v1` JSON files, or a directory containing those JSON files. |
+| `--extra-edge FILE`         | Add supplemental caller-to-callee edges to the static call graph from a JSON file or directory. |
 
 `proj_dir` must be a git repository.
 
 By default, every invocation wipes the existing `fm_agent/` directory and restarts from scratch, so an interrupted run loses all prior progress. Pass `--resume` (or set the environment variable `FM_AGENT_RESUME=1`) to continue where the previous run left off. In resume mode FM-Agent keeps the existing `fm_agent/` directory and only does the remaining work.
 
-Use `--extra-edge FILE` when the static parser cannot see an important call relationship, such as indirect syscall dispatch. Supplemental edges are applied to full, entry-point-scoped, and incremental runs. The older `--extra-call-edges` name is still accepted. The JSON shape is:
+Use `--extra-edge FILE` when the static parser cannot see an important call relationship, such as indirect syscall dispatch. Supplemental edges are applied to full, entry-point-scoped, and incremental runs. The JSON shape is:
 
 ```json
 {
-  "schema": "fm-agent-extra-edges-v1",
   "edges": [
     {
       "caller": "nanosleep",

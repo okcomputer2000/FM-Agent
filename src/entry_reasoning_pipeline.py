@@ -269,7 +269,6 @@ def run_entry_pipeline(
     # a later run in the same process.
     add_test_file_exemption(_entry_func_source_rel(entry_func))
     try:
-        extra_call_edges = load_call_edges(extra_call_edges_path)
         _run_entry_pipeline_inner(
             proj_dir,
             work_dir,
@@ -277,7 +276,6 @@ def run_entry_pipeline(
             end_funcs,
             resume,
             extra_call_edges_path,
-            extra_call_edges,
         )
     finally:
         clear_test_file_exemptions()
@@ -423,10 +421,10 @@ def _run_entry_pipeline_inner(
     end_funcs,
     resume,
     extra_call_edges_path,
-    extra_call_edges,
 ):
     """Body of run_entry_pipeline; runs with the entry source file exempted."""
     # 1. Selection: extract fresh into a temp workspace and build the call graph.
+    extra_call_edges = load_call_edges(extra_call_edges_path)
     all_by_source, keep_by_source = _select_functions_by_source(
         proj_dir,
         entry_func,

@@ -1,9 +1,8 @@
 """Supplemental caller/callee edge parsing for call-graph construction.
 
-The only supported on-disk format is JSON using this schema:
+The on-disk format is JSON with an ``edges`` list:
 
 {
-  "schema": "fm-agent-extra-edges-v1",
   "edges": [
     {
       "caller": "nanosleep",
@@ -17,7 +16,8 @@ The only supported on-disk format is JSON using this schema:
 
 Only ``caller`` and ``callee`` are required. Metadata fields such as ``kind``,
 ``syscall``, and ``syscall_nr`` may be present, but the graph builder only uses
-the endpoints, aliases, and evidence/source text.
+the endpoints, aliases, and evidence/source text. A ``schema`` field may be
+present but is not required or validated.
 """
 
 from __future__ import annotations
@@ -27,9 +27,6 @@ import os
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Iterable
-
-
-SCHEMA = "fm-agent-extra-edges-v1"
 
 
 @dataclass(frozen=True)
@@ -43,14 +40,8 @@ class CallEdge:
     callee_aliases: tuple[str, ...] = ()
 
 
-def default_call_edges_path(cwd: str | os.PathLike | None = None) -> str | None:
-    """Return the default ./docs/extra-edge path when it exists."""
-    path = Path(cwd or os.getcwd()) / "docs" / "extra-edge"
-    return str(path) if path.exists() else None
-
-
 def load_call_edges(path: str | os.PathLike | None) -> list[CallEdge]:
-    """Load supplemental call edges from a schema-v1 JSON file or directory."""
+    """Load supplemental call edges from a JSON file or directory."""
     if path is None:
         return []
 
@@ -66,7 +57,7 @@ def load_call_edges(path: str | os.PathLike | None) -> list[CallEdge]:
 
 
 def _is_edge_file(path: Path) -> bool:
-    return path.name == "extra-edge" or path.suffix.lower() == ".json"
+    return path.suffix.lower() == ".json"
 
 
 def _load_call_edge_file(edge_path: Path) -> list[CallEdge]:
@@ -83,9 +74,7 @@ def _load_json_edges(text: str, source_path: str) -> list[CallEdge]:
         raise ValueError(f"{source_path}: invalid JSON: {exc}") from exc
 
     if not isinstance(data, dict):
-        raise ValueError(f"{source_path}: expected JSON object")
-    if data.get("schema") != SCHEMA:
-        raise ValueError(f"{source_path}: expected schema {SCHEMA!r}")
+        raise ValueError(f"{source_path}: expected JSON object with an 'edges' list")
     if not isinstance(data.get("edges"), list):
         raise ValueError(f"{source_path}: expected an 'edges' list")
 

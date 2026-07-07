@@ -5,7 +5,6 @@ The output is a single JSON file in the format consumed by
 ``src.call_graph_edges``:
 
 {
-  "schema": "fm-agent-extra-edges-v1",
   "edges": [
     {
       "caller": "nanosleep",
@@ -32,15 +31,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
 
-SCHEMA = "fm-agent-extra-edges-v1"
-DEFAULT_KERNEL_ROOT = Path("/mnt/nvme2/lianganran/kernel_liteos_a")
+DEFAULT_USER_LIB_ROOT = Path("third_party/musl")
 C_SUFFIXES = {".c", ".cc", ".cpp", ".h"}
 SYSCALL_CALL_NAMES = ("__syscall", "syscall", "syscall_cp", "__syscall_cp")
 CALL_KEYWORDS = {
@@ -88,6 +88,17 @@ def repo_rel(path: Path, root: Path) -> str:
 
 def loc(path: Path, line: int, root: Path) -> str:
     return f"{repo_rel(path, root)}:{line}"
+
+
+def common_root(paths: Sequence[Path]) -> Path:
+    return Path(os.path.commonpath([str(path.resolve()) for path in paths]))
+
+
+def require_dir(path: Path, label: str) -> None:
+    if not path.exists():
+        raise FileNotFoundError(f"{label} not found: {path}")
+    if not path.is_dir():
+        raise NotADirectoryError(f"{label} is not a directory: {path}")
 
 
 def read_text(path: Path) -> str:
@@ -264,8 +275,13 @@ def syscall_token_from_expr(expr: str) -> str | None:
     return normalize_syscall_token(tokens[0])
 
 
-def parse_syscall_lookup(kernel_root: Path) -> dict[str, list[SyscallDef]]:
+def parse_syscall_lookup(kernel_root: Path, source_root: Path) -> dict[str, list[SyscallDef]]:
     path = kernel_root / "syscall/syscall_lookup.h"
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"syscall lookup not found under --kernel-root: {path}"
+        )
+
     syscalls = defaultdict(list)
     conditions = []
     seen = set()
@@ -303,7 +319,7 @@ def parse_syscall_lookup(kernel_root: Path) -> dict[str, list[SyscallDef]]:
             SyscallDef(
                 syscall=syscall,
                 handler=handler,
-                evidence=f"{loc(path, line_num, kernel_root)} maps {syscall} to {handler}",
+                evidence=f"{loc(path, line_num, source_root)} maps {syscall} to {handler}",
                 condition=condition,
             )
         )
@@ -323,12 +339,12 @@ def find_call_args(text: str, name: str) -> Iterator[tuple[int, list[str]]]:
 def collect_musl_syscall_uses(
     musl_funcs: dict[str, list[FunctionDef]],
     musl_root: Path,
-    kernel_root: Path,
+    source_root: Path,
 ) -> tuple[dict[str, dict[str, tuple[str, ...]]], dict[str, set[str]]]:
     records: dict[str, dict[str, tuple[str, ...]]] = defaultdict(dict)
     function_names = set(musl_funcs)
     calls: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
-    aliases = extract_musl_aliases(musl_root, kernel_root)
+    aliases = extract_musl_aliases(musl_root, source_root)
     call_re = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
 
     for defs in musl_funcs.values():
@@ -346,7 +362,7 @@ def collect_musl_syscall_uses(
                         records,
                         fn.name,
                         syscall,
-                        (f"{loc(path, line, kernel_root)} uses {args[0].strip()}",),
+                        (f"{loc(path, line, source_root)} uses {args[0].strip()}",),
                     )
 
             for match in call_re.finditer(fn.body):
@@ -354,7 +370,7 @@ def collect_musl_syscall_uses(
                 if callee in CALL_KEYWORDS or callee == fn.name or callee not in function_names:
                     continue
                 line = fn.body_line + fn.body.count("\n", 0, match.start())
-                calls[fn.name][callee].add(f"{loc(path, line, kernel_root)} calls {callee}")
+                calls[fn.name][callee].add(f"{loc(path, line, source_root)} calls {callee}")
 
     changed = True
     while changed:
@@ -376,7 +392,7 @@ def collect_musl_syscall_uses(
     return records, public_aliases
 
 
-def extract_musl_aliases(musl_root: Path, kernel_root: Path) -> list[tuple[str, str, str]]:
+def extract_musl_aliases(musl_root: Path, source_root: Path) -> list[tuple[str, str, str]]:
     aliases = []
     for path in iter_files(musl_root, C_SUFFIXES, ("src", "porting/liteos_a/user")):
         for line_num, line in enumerate(read_text(path).splitlines(), start=1):
@@ -385,7 +401,7 @@ def extract_musl_aliases(musl_root: Path, kernel_root: Path) -> list[tuple[str, 
                     (
                         match.group(1),
                         match.group(2),
-                        f"{loc(path, line_num, kernel_root)} aliases {match.group(2)} to {match.group(1)}",
+                        f"{loc(path, line_num, source_root)} aliases {match.group(2)} to {match.group(1)}",
                     )
                 )
     return aliases
@@ -485,20 +501,31 @@ def dedupe_edges(edges: Iterable[dict[str, object]]) -> list[dict[str, object]]:
     return sorted(by_key.values(), key=lambda item: (str(item["caller"]), str(item["callee"]), str(item.get("syscall", ""))))
 
 
-def extract_extra_edges(kernel_root: Path, apis: set[str] | None = None) -> dict[str, object]:
+def extract_extra_edges(
+    kernel_root: Path,
+    user_lib_root: Path,
+    apis: set[str] | None = None,
+) -> dict[str, object]:
     kernel_root = kernel_root.resolve()
-    musl_root = kernel_root / "third_party/musl"
-    if not musl_root.exists():
-        raise FileNotFoundError(f"musl root not found: {musl_root}")
+    user_lib_root = user_lib_root.resolve()
+    source_root = common_root((kernel_root, user_lib_root))
 
-    musl_funcs = build_function_index(musl_root, ("src", "porting/liteos_a/user"))
-    syscalls = parse_syscall_lookup(kernel_root)
-    records, public_aliases = collect_musl_syscall_uses(musl_funcs, musl_root, kernel_root)
+    require_dir(kernel_root, "--kernel-root")
+    require_dir(user_lib_root, "--user-lib-root")
+
+    musl_funcs = build_function_index(user_lib_root, ("src", "porting/liteos_a/user"))
+    syscalls = parse_syscall_lookup(kernel_root, source_root)
+    records, public_aliases = collect_musl_syscall_uses(
+        musl_funcs,
+        user_lib_root,
+        source_root,
+    )
     edges = build_edges(records, public_aliases, syscalls, apis)
 
     return {
-        "schema": SCHEMA,
         "kernel_root": str(kernel_root),
+        "user_lib_root": str(user_lib_root),
+        "source_root": str(source_root),
         "edges": edges,
         "stats": {
             "internal_functions_with_syscall_paths": len(records),
@@ -511,7 +538,18 @@ def extract_extra_edges(kernel_root: Path, apis: set[str] | None = None) -> dict
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--kernel-root", type=Path, default=DEFAULT_KERNEL_ROOT)
+    parser.add_argument(
+        "--kernel-root",
+        type=Path,
+        required=True,
+        help="kernel source root containing syscall/syscall_lookup.h",
+    )
+    parser.add_argument(
+        "--user-lib-root",
+        type=Path,
+        default=DEFAULT_USER_LIB_ROOT,
+        help="user-space C library source root, such as third_party/musl",
+    )
     parser.add_argument("--out", type=Path, default=Path("docs/extra-edge"))
     parser.add_argument(
         "--api",
@@ -535,7 +573,12 @@ def main() -> int:
     api_filter = set(args.api or [])
     api_filter.update(args.apis or [])
 
-    graph = extract_extra_edges(args.kernel_root, api_filter or None)
+    try:
+        graph = extract_extra_edges(args.kernel_root, args.user_lib_root, api_filter or None)
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(graph, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     if args.print_summary:

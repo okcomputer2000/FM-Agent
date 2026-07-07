@@ -4,7 +4,7 @@ from config import (
     OPENCODE_MODEL_PROVIDER,
 )
 from src.entry_reasoning_pipeline import run_entry_pipeline
-from src.call_graph_edges import default_call_edges_path, load_call_edges
+from src.call_graph_edges import load_call_edges
 from src.file_utils import (
     collect_file_names,
     is_file_ready,
@@ -411,19 +411,17 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--extra-edge",
-        "--extra-call-edges",
         dest="extra_edge",
         metavar="FILE",
         default=None,
-        help="optional fm-agent-extra-edges-v1 JSON file, or directory of JSON "
-        "files, containing supplemental caller->callee edges. Defaults to "
-        "<proj_dir>/docs/extra-edge when that path exists.",
+        help="optional JSON file, or directory of JSON files, containing "
+        "supplemental caller->callee edges.",
     )
     args = parser.parse_args()
 
     resume = args.resume or os.environ.get("FM_AGENT_RESUME") == "1"
     proj_dir = os.path.abspath(args.proj_dir)
-    extra_call_edges_path = args.extra_edge or default_call_edges_path(proj_dir)
+    extra_call_edges_path = args.extra_edge
     if extra_call_edges_path:
         extra_call_edges_path = os.path.abspath(extra_call_edges_path)
 
