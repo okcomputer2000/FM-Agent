@@ -45,6 +45,12 @@ from .prompts import _load_spec_check_json
 from .scope import _parse_issue_signals, rank_functions_in_file
 from .languages.codegraph import try_codegraph_init
 from .verification import _verify_single_file, _validate_single_bug, _generate_validation_summary, EXT_TO_LANG as _VERIFY_EXT_TO_LANG
+from .domain_knowledge import (
+    format_domain_knowledge_bullets,
+    list_staged_domain_knowledge_relpaths,
+    load_staged_domain_knowledge_text,
+    stage_domain_knowledge_files,
+)
 
 
 class _StdoutTee:
@@ -551,7 +557,12 @@ def _topdown_ordered_fqns(work_dir):
     return ordered
 
 
-def run_incremental_pipeline(proj_dir, intent_file_path, old_commit_id):
+def run_incremental_pipeline(
+    proj_dir,
+    intent_file_path,
+    old_commit_id,
+    domain_knowledge_files=None,
+):
     """
     Run the pipeline in incremental mode, intent_file_path is a file (absolute path) defining the goal of modification.
 
@@ -571,6 +582,14 @@ def run_incremental_pipeline(proj_dir, intent_file_path, old_commit_id):
     output_dir = os.path.join(work_dir, "logic_verification_results")
 
     _setup_incremental_logging(work_dir)
+    staged_knowledge = stage_domain_knowledge_files(
+        proj_dir, work_dir, domain_knowledge_files
+    )
+    if staged_knowledge:
+        logging.info(
+            "  user domain knowledge: %d markdown file(s).",
+            len(staged_knowledge),
+        )
 
     logging.info("=" * 70)
     logging.info("INCREMENTAL PIPELINE START")
@@ -586,7 +605,7 @@ def run_incremental_pipeline(proj_dir, intent_file_path, old_commit_id):
         logging.warning(
             "No previous full run detected (phases.json missing or incomplete extracted_functions), so falling back to a full run rather than incremental."
         )
-        run_pipeline(proj_dir)
+        run_pipeline(proj_dir, domain_knowledge_files=domain_knowledge_files)
         return
     logging.info("  -> previous full run found; proceeding with incremental analysis.")
 
@@ -860,6 +879,11 @@ def _llm_select_json(work_dir, prompt_content, stage, trace_meta=None):
     except (ValueError, TypeError) as exc:
         logging.error("%s: could not parse LLM JSON output: %s", stage, exc)
         return None
+
+
+def _domain_knowledge_prompt_section(work_dir):
+    text = load_staged_domain_knowledge_text(work_dir)
+    return f"## User-provided domain knowledge\n\n{text}\n\n" if text else ""
 
 
 def collect_relevent_function_scope(proj_dir, developer_intent, changed_functions, range=None):
@@ -1174,6 +1198,8 @@ def _llm_check_spec_update(proj_dir, work_dir, idx, fqn, lang_key, comment_prefi
             "may need to be created for them.\n\n"
         )
 
+    knowledge_section = _domain_knowledge_prompt_section(work_dir)
+
     prompt_content = (
         "# Update Function Specification\n\n"
         "A modification is being applied to a codebase to achieve the developer intent "
@@ -1184,6 +1210,7 @@ def _llm_check_spec_update(proj_dir, work_dir, idx, fqn, lang_key, comment_prefi
         f"- Known callees of this function: {callee_hint}.\n\n"
         "## Developer intent\n\n"
         f"{developer_intent}\n\n"
+        f"{knowledge_section}"
         "## Current function source\n\n"
         f"```{lang_key}\n{source.strip()}\n```\n\n"
         "## Current [SPEC] block (this function's own behavioral specification)\n\n"
@@ -1238,6 +1265,8 @@ def _llm_check_caller_info_update(proj_dir, work_dir, idx, caller_fqn, callee_na
     Returns the parsed result dict — keys "info_updated" (bool) and "new_info" (str) — or
     None when the LLM produced nothing usable.
     """
+    knowledge_section = _domain_knowledge_prompt_section(work_dir)
+
     prompt_content = (
         "# Reconcile a Caller's [INFO] Block with a Changed Callee\n\n"
         f"The callee `{callee_name}`'s behavioral specification was just updated. The caller "
@@ -1247,6 +1276,7 @@ def _llm_check_caller_info_update(proj_dir, work_dir, idx, caller_fqn, callee_na
         "conflict (no contradictory pre/post-conditions). Leave the entries for every other "
         "callee unchanged.\n\n"
         f"Comment prefix for this language: `{comment_prefix}`.\n\n"
+        f"{knowledge_section}"
         "## Callee's updated [SPEC] block\n\n"
         f"{callee_new_spec}\n\n"
         "## Caller's current source\n\n"
@@ -1342,15 +1372,27 @@ def _opencode_generate_spec(proj_dir, work_dir, idx, fqn, lang_key, comment_pref
             caller_section += f"### According to {cfqn}\n\n{exp.strip()}\n\n"
 
     callee_hint = ", ".join(sorted(callee_names)) if callee_names else "(none)"
+    user_knowledge_paths = list_staged_domain_knowledge_relpaths(work_dir)
+    if user_knowledge_paths:
+        user_knowledge_step = (
+            "2. Read these user-provided domain knowledge Markdown files and use "
+            "them as additional context:\n"
+            f"{format_domain_knowledge_bullets(user_knowledge_paths)}\n"
+        )
+        step_offset = 1
+    else:
+        user_knowledge_step = ""
+        step_offset = 0
+    info_step_number = 3 + step_offset
     if callee_names:
         info_step = (
-            "3. Because this function has callees, also produce an [INFO] block recording the "
+            f"{info_step_number}. Because this function has callees, also produce an [INFO] block recording the "
             "expected behavioral spec of each callee it depends on (the `[INFO]` ... `[INFO]` "
             f"block only, markers included, every line prefixed with `{comment_prefix}`), and "
             "list the names of the callees you recorded.\n"
         )
     else:
-        info_step = "3. This function has no callees, so produce no [INFO] block.\n"
+        info_step = f"{info_step_number}. This function has no callees, so produce no [INFO] block.\n"
 
     prompt_content = (
         "# Generate Function Specification\n\n"
@@ -1368,11 +1410,12 @@ def _opencode_generate_spec(proj_dir, work_dir, idx, fqn, lang_key, comment_pref
         "## Steps\n\n"
         "1. Read `fm_agent/spec_prompts/system_prompt.md` for the exact [SPEC]/[INFO] format "
         "rules used by this project.\n"
-        "2. Produce the COMPLETE [SPEC] block describing this function's behavior — the "
+        f"{user_knowledge_step}"
+        f"{2 + step_offset}. Produce the COMPLETE [SPEC] block describing this function's behavior — the "
         "`[SPEC]` ... `[SPEC]` block only, markers included, every line prefixed with "
         f"`{comment_prefix}`, and NO source code.\n"
         f"{info_step}"
-        f"4. Write your answer to `{result_relpath}` as a JSON object with keys:\n"
+        f"{4 + step_offset}. Write your answer to `{result_relpath}` as a JSON object with keys:\n"
         '   - "spec_updated": boolean — true when you produced a [SPEC] block.\n'
         '   - "new_spec": string — the full [SPEC] block.\n'
         '   - "info_updated": boolean — true when you produced an [INFO] block.\n'
@@ -1388,7 +1431,11 @@ def _opencode_generate_spec(proj_dir, work_dir, idx, fqn, lang_key, comment_pref
         prompt_content,
         result_relpath,
         stage="generate_function_spec",
-        input_files=[prompt_relpath, "fm_agent/spec_prompts/system_prompt.md"],
+        input_files=[
+            prompt_relpath,
+            "fm_agent/spec_prompts/system_prompt.md",
+            *user_knowledge_paths,
+        ],
     )
 
 

@@ -32,6 +32,11 @@ from src.languages.codegraph import try_codegraph_init
 from src.pipeline_setup import (
     _run_setup_extract,
 )
+from src.domain_knowledge import (
+    collect_domain_knowledge_paths,
+    list_staged_domain_knowledge_relpaths,
+    stage_domain_knowledge_files,
+)
 import os
 import sys
 import argparse
@@ -122,6 +127,7 @@ def _run_spec_generation_batch(
                 "fm_agent/workflow_spec_step4_batch.md",
                 batch_prompt_rel,
                 "fm_agent/spec_prompts/system_prompt.md",
+                *list_staged_domain_knowledge_relpaths(work_dir),
             ],
             output_files=function_files,
             summary=f"OpenCode spec generation for {batch_file}",
@@ -137,7 +143,12 @@ def _run_spec_generation_batch(
         return exc.returncode
 
 
-def run_pipeline(proj_dir, resume=False, required_source_files=None):
+def run_pipeline(
+    proj_dir,
+    resume=False,
+    required_source_files=None,
+    domain_knowledge_files=None,
+):
     if not os.path.isdir(proj_dir):
         print(f"[Pipeline] ERROR: proj_dir does not exist or is not a directory: {proj_dir}")
         sys.exit(1)
@@ -163,6 +174,14 @@ def run_pipeline(proj_dir, resume=False, required_source_files=None):
     else:
         _clean_previous_run(work_dir)
     os.makedirs(work_dir, exist_ok=True)
+    domain_knowledge_relpaths = stage_domain_knowledge_files(
+        proj_dir, work_dir, domain_knowledge_files
+    )
+    if domain_knowledge_relpaths:
+        print(
+            "[Pipeline] User domain knowledge: "
+            f"{len(domain_knowledge_relpaths)} markdown file(s)."
+        )
 
     # Copy workflow_setup_extract.md to proj_dir and run opencode against it.
     # _run_setup_extract also force-lists any required_source_files the agent
@@ -406,7 +425,8 @@ def run_pipeline(proj_dir, resume=False, required_source_files=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         usage="python3 main.py <proj_dir> [--resume] [--incremental INTENT_FILE] "
-              "[--isolate] [--entry-func PATH] [--end-func PATH ...]",
+              "[--domain-knowledge FILE ...] [--isolate] [--entry-func PATH] "
+              "[--end-func PATH ...]",
         description="Run the FM agent pipeline on a project directory.",
     )
     parser.add_argument("proj_dir", help="path to the project directory")
@@ -430,6 +450,18 @@ if __name__ == "__main__":
         "the project instead of the project directory itself.",
     )
     parser.add_argument(
+        "--domain-knowledge",
+        "--knowledge",
+        metavar="FILE",
+        action="append",
+        nargs="+",
+        default=[],
+        help="additional Markdown domain-knowledge file(s) to copy into "
+        "fm_agent/spec_prompts/domain_context/user_knowledge/ and provide to "
+        "setup, spec generation, and validation agents. May be repeated. "
+        "FM_AGENT_DOMAIN_KNOWLEDGE can also provide os.pathsep-separated files.",
+    )
+    parser.add_argument(
         "--entry-func",
         metavar="PATH",
         default=None,
@@ -447,6 +479,14 @@ if __name__ == "__main__":
 
     resume = args.resume or os.environ.get("FM_AGENT_RESUME") == "1"
     proj_dir = os.path.abspath(args.proj_dir)
+    try:
+        domain_knowledge_files = collect_domain_knowledge_paths(
+            args.domain_knowledge,
+            base_dir=proj_dir,
+            fallback_base_dir=os.getcwd(),
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     # ---- pre-flight environment check (shared by all pipeline modes) ----
     import config
@@ -465,6 +505,7 @@ if __name__ == "__main__":
             entry_func=args.entry_func,
             end_funcs=args.end_func,
             resume=resume,
+            domain_knowledge_files=domain_knowledge_files,
         )
         end_time = time.time()
         logging.info(f"Total time: {end_time - start_time:.2f} seconds")
@@ -515,9 +556,18 @@ if __name__ == "__main__":
             # Incremental mode requires a recorded commit to diff against; without a
             # version.log from a previous run, fall back to the full pipeline.
             if args.incremental and old_commit:
-                run_incremental_pipeline(run_dir, intent_path, old_commit)
+                run_incremental_pipeline(
+                    run_dir,
+                    intent_path,
+                    old_commit,
+                    domain_knowledge_files=domain_knowledge_files,
+                )
             else:
-                run_pipeline(run_dir, resume=resume)
+                run_pipeline(
+                    run_dir,
+                    resume=resume,
+                    domain_knowledge_files=domain_knowledge_files,
+                )
             # Record the commit that was processed. Written after the pipeline since
             # it recreates fm_agent/; with --isolate it lives in the snapshot and is
             # copied back to the real project below. Only recorded on success so a

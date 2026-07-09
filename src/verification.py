@@ -5,6 +5,11 @@ from .reasoner import reasoner, _parse_spec_conditions, _sanitize_strings
 from .file_utils import is_file_ready
 from .opencode_trace import function_id_from_result_path, run_opencode_traced
 from .cli_backend import build_agent_command, is_cli_backend_enabled
+from .domain_knowledge import (
+    format_domain_knowledge_bullets,
+    list_staged_domain_knowledge_relpaths,
+    load_staged_domain_knowledge_text,
+)
 import os
 import re
 import json
@@ -275,6 +280,9 @@ def _verify_single_file(file_path, input_dir, output_dir, language, work_dir=Non
                 "function_id": os.path.splitext(rel_function)[0].replace(os.sep, "::"),
                 "function_file": os.path.join("extracted_functions", rel_function).replace(os.sep, "/"),
             }
+        domain_knowledge = load_staged_domain_knowledge_text(work_dir) if work_dir else ""
+        if domain_knowledge:
+            knowledge = f"{knowledge}\n\n{domain_knowledge}" if knowledge else domain_knowledge
         result = reasoner(func, spec, knowledge, language, trace_context=trace_context)
 
         if "passes the verification" in result:
@@ -341,11 +349,24 @@ def _validate_single_bug(result_json_rel, proj_dir, work_dir=None, resume=False)
     with open(base_md_path, "r") as f:
         base_content = f.read()
 
+    user_knowledge_paths = list_staged_domain_knowledge_relpaths(work_dir)
+    if user_knowledge_paths:
+        user_knowledge_section = (
+            "## User-Provided Domain Knowledge\n\n"
+            "Read these Markdown files as additional context for intended behavior, "
+            "terminology, data encodings, and invariants before validating the "
+            "candidate bug:\n\n"
+            f"{format_domain_knowledge_bullets(user_knowledge_paths)}\n\n---\n\n"
+        )
+    else:
+        user_knowledge_section = ""
+
     # Generate a per-file prompt with target file and bug ID header
     prompt_content = (
         "# Bug Validator\n\n"
         f"**Target result file:** `{result_json_rel}`\n"
         f"**Bug ID:** `{bug_id}`\n\n---\n\n"
+        + user_knowledge_section
         + base_content
     )
 
@@ -395,7 +416,11 @@ def _validate_single_bug(result_json_rel, proj_dir, work_dir=None, resume=False)
                     command=command,
                     stage="bug_validation",
                     function_ids=[function_id],
-                    input_files=[prompt_filename, result_json_rel],
+                    input_files=[
+                        prompt_filename,
+                        result_json_rel,
+                        *user_knowledge_paths,
+                    ],
                     output_files=[
                         os.path.join("fm_agent", "bug_validation", f"{bug_id}.md"),
                         result_relpath,
