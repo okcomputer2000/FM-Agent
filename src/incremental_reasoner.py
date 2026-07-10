@@ -21,7 +21,6 @@ from config import (
 from .extract import (
     EXT_TO_LANG,
     LANG_CONFIG,
-    _is_test_file,
     extract_functions_from_file,
     run_extraction,
 )
@@ -32,7 +31,14 @@ from .generate_topdown_layers import (
     _load_phases,
     generate_topdown_layers,
 )
-from .file_utils import is_file_ready, collect_file_names
+from .file_utils import (
+    is_file_ready,
+    collect_file_names,
+    _is_test_file,
+    _is_under_submodules,
+    _get_all_phase_files,
+    _write_file_names,
+)
 from .generate_batch_prompts import (
     _detect_comment_prefix,
     extract_callee_spec_from_info,
@@ -44,7 +50,14 @@ from .llm_client import _llm_provider_client, _llm_call
 from .cli_backend import build_agent_command, is_cli_backend_enabled
 from .prompts import _load_spec_check_json
 from .scope import _parse_issue_signals, rank_functions_in_file
+from .languages.codegraph import try_codegraph_init
 from .verification import _verify_single_file, _validate_single_bug, _generate_validation_summary, EXT_TO_LANG as _VERIFY_EXT_TO_LANG
+from .domain_knowledge import (
+    format_domain_knowledge_bullets,
+    list_staged_domain_knowledge_relpaths,
+    load_staged_domain_knowledge_text,
+    stage_domain_knowledge_files,
+)
 
 
 class _StdoutTee:
@@ -141,7 +154,7 @@ def _setup_incremental_logging(work_dir):
     return log_path
 
 
-def check_last_run_existence(proj_dir):
+def check_last_run_existence(proj_dir, submodules=None):
     """
     Return whether a full pipeline run (run_pipeline) has already completed under proj_dir.
 
@@ -156,8 +169,10 @@ def check_last_run_existence(proj_dir):
          previous full run did not finish, so it is not a sound basis for incremental
          analysis.
 
-    Returns True only when both hold; otherwise False (so the caller can fall back to a
-    full run rather than fail on missing/incomplete phases.json / extracted_functions).
+    When submodules is provided, only extracted functions under those selected
+    project-relative directories are considered. Returns True only when the
+    selected scope has at least one ready function and no selected function is
+    incomplete; otherwise False (so the caller can fall back to a scoped full run).
     """
     work_dir = os.path.join(proj_dir, "fm_agent")
 
@@ -171,8 +186,12 @@ def check_last_run_existence(proj_dir):
     saw_function = False
     for root, _, files in os.walk(extracted_dir):
         for fname in files:
+            fpath = os.path.join(root, fname)
+            rel = os.path.relpath(fpath, extracted_dir).replace(os.sep, "/")
+            if submodules and not _is_under_submodules(rel, submodules):
+                continue
             saw_function = True
-            if not is_file_ready(os.path.join(root, fname)):
+            if not is_file_ready(fpath):
                 return False
     return saw_function
 
@@ -276,15 +295,16 @@ def _reapply_existing_specs(proj_dir, specs):
             f.write(header + "\n\n" + source.lstrip("\n"))
 
 
-def _collect_changed_functions(proj_dir, old_commit_id):
+def _collect_changed_functions(proj_dir, old_commit_id, submodules=None):
     """
     Determine which functions changed between commit old_commit_id and the current working
     tree under proj_dir, so the incremental pipeline only re-analyzes what actually moved.
 
     Only source files whose extension is in EXT_TO_LANG are considered; test files (per
-    _is_test_file) and anything under the fm_agent work dir are ignored. For each candidate
-    file, functions are extracted from both the old (old_commit_id) version and the current
-    working-tree version using the same parser as extract.py, then compared by source text.
+    _is_test_file), anything under the fm_agent work dir, and files outside submodules
+    when a submodule scope is provided are ignored. For each candidate file, functions are
+    extracted from both the old (old_commit_id) version and the current working-tree
+    version using the same parser as extract.py, then compared by source text.
 
     Returns a dict mapping each changed file's absolute path to a dict with keys "added",
     "removed", and "modified", each a sorted list of function names. Files with no
@@ -320,6 +340,7 @@ def _collect_changed_functions(proj_dir, old_commit_id):
     files = [
         f for f in dict.fromkeys(changed + untracked)
         if not _is_test_file(f) and not _is_workspace_file(f)
+        and _is_under_submodules(f, submodules)
     ]
 
     def _path_exists_in_commit(rel_path):
@@ -551,7 +572,13 @@ def _topdown_ordered_fqns(work_dir):
     return ordered
 
 
-def run_incremental_pipeline(proj_dir, intent_file_path, old_commit_id):
+def run_incremental_pipeline(
+    proj_dir,
+    intent_file_path,
+    old_commit_id,
+    domain_knowledge_files=None,
+    submodules=None,
+):
     """
     Run the pipeline in incremental mode, intent_file_path is a file (absolute path) defining the goal of modification.
 
@@ -571,22 +598,36 @@ def run_incremental_pipeline(proj_dir, intent_file_path, old_commit_id):
     output_dir = os.path.join(work_dir, "logic_verification_results")
 
     _setup_incremental_logging(work_dir)
+    staged_knowledge = stage_domain_knowledge_files(
+        proj_dir, work_dir, domain_knowledge_files
+    )
+    if staged_knowledge:
+        logging.info(
+            "  user domain knowledge: %d markdown file(s).",
+            len(staged_knowledge),
+        )
 
     logging.info("=" * 70)
     logging.info("INCREMENTAL PIPELINE START")
     logging.info("  project dir : %s", proj_dir)
     logging.info("  intent file : %s", intent_file_path)
     logging.info("  base commit : %s", old_commit_id)
+    if submodules:
+        logging.info("  submodule scope : %s", ", ".join(submodules))
     logging.info("=" * 70)
 
     # 1. Check whether there is a last run to compare against; if not, fall back to a full run since we have no basis for incremental analysis.
     logging.info("[Stage 1/10] Checking for a previous full run to compare against...")
-    has_last_run = check_last_run_existence(proj_dir)
+    has_last_run = check_last_run_existence(proj_dir, submodules=submodules)
     if not has_last_run:
         logging.warning(
             "No previous full run detected (phases.json missing or incomplete extracted_functions), so falling back to a full run rather than incremental."
         )
-        run_pipeline(proj_dir)
+        run_pipeline(
+            proj_dir,
+            domain_knowledge_files=domain_knowledge_files,
+            submodules=submodules,
+        )
         return
     logging.info("  -> previous full run found; proceeding with incremental analysis.")
 
@@ -637,8 +678,10 @@ def run_incremental_pipeline(proj_dir, intent_file_path, old_commit_id):
 
     # 3. Re-generate the phases.json
     logging.info("[Stage 3/10] Generating new phases.json based on current working tree...")
-    phases_json_path = os.path.join(proj_dir, "fm_agent", "phases.json")
-    _run_setup_extract(proj_dir, work_dir, script_dir, is_incremental=True)
+    _run_setup_extract(
+        proj_dir, work_dir, script_dir,
+        is_incremental=True, submodules=submodules,
+    )
     logging.info("  -> phases.json regenerated.")
 
     # 4. Update functions under fm_agent/extracted_functions/.
@@ -650,13 +693,21 @@ def run_incremental_pipeline(proj_dir, intent_file_path, old_commit_id):
     logging.info("[Stage 4/10] Re-extracting functions and restoring previous specs...")
     old_spec = extract_existing_specs(proj_dir)
     logging.info("  -> captured %d existing spec block(s) before re-extraction.", len(old_spec))
+    # Rebuild the codegraph index before re-extraction. The index still reflects the code as
+    # of the previous full run, but the working tree has changed since then; run_extraction
+    # (and the downstream scope ranking) read function bodies and spans from codegraph, so a
+    # stale index would yield boundaries for the old code. try_codegraph_init rebuilds by
+    # default; no-op when codegraph is uninstalled (extraction then falls back to regex).
+    try_codegraph_init(proj_dir)
     run_extraction(proj_dir, work_dir=work_dir, force=True, verbose=True)
     _reapply_existing_specs(proj_dir, old_spec)
     logging.info("  -> functions re-extracted and prior [SPEC]/[INFO] headers reapplied.")
 
     # 5. Collect changed functions by comparing against the old version of functions in commit_id
     logging.info("[Stage 5/10] Collecting changed functions vs. base commit...")
-    changed_functions = _collect_changed_functions(proj_dir, old_commit_id)
+    changed_functions = _collect_changed_functions(
+        proj_dir, old_commit_id, submodules=submodules
+    )
     n_added = sum(len(c.get("added", [])) for c in changed_functions.values())
     n_removed = sum(len(c.get("removed", [])) for c in changed_functions.values())
     n_modified = sum(len(c.get("modified", [])) for c in changed_functions.values())
@@ -673,12 +724,20 @@ def run_incremental_pipeline(proj_dir, intent_file_path, old_commit_id):
 
     # 6. Update file list
     logging.info("[Stage 6/10] Collecting file list...")
-    file_list = collect_file_names(input_dir, os.path.join(work_dir, "fm_agent_file_list.json"))
+    file_list_path = os.path.join(work_dir, "fm_agent_file_list.json")
+    file_list = collect_file_names(input_dir, file_list_path)
+    if submodules:
+        with open(os.path.join(work_dir, "phases.json"), "r") as f:
+            phases_data = json.load(f)
+        file_list = _write_file_names(
+            _get_all_phase_files(phases_data, input_dir), file_list_path
+        )
     logging.info("  -> file list has %d entr(ies).", len(file_list))
 
     # 7. Update top-down layers
     logging.info("[Stage 7/10] Generating topdown layers...")
-    phases_data = json.load(open(os.path.join(work_dir, "phases.json")))
+    with open(os.path.join(work_dir, "phases.json"), "r") as f:
+        phases_data = json.load(f)
     generate_topdown_layers(work_dir)
     logging.info("  -> topdown layers generated for %d phase(s).", len(phases_data.get("phases", [])))
 
@@ -703,7 +762,8 @@ def run_incremental_pipeline(proj_dir, intent_file_path, old_commit_id):
     # 10. Run the verification stage only on the functions that satisfy one of the following conditions: 1) the function is changed; 2) the function spec is changed after step 9; 3) the callee spec of the function is changed.
     logging.info("[Stage 10/10] Verifying changed and affected functions...")
     buggy_files = _verify_incremental_functions(
-        proj_dir, work_dir, changed_functions, updated_spec_files
+        proj_dir, work_dir, changed_functions, updated_spec_files,
+        submodules=submodules,
     )
     logging.info("=" * 70)
     logging.info(
@@ -854,6 +914,11 @@ def _llm_select_json(work_dir, prompt_content, stage, trace_meta=None):
     except (ValueError, TypeError) as exc:
         logging.error("%s: could not parse LLM JSON output: %s", stage, exc)
         return None
+
+
+def _domain_knowledge_prompt_section(work_dir):
+    text = load_staged_domain_knowledge_text(work_dir)
+    return f"## User-provided domain knowledge\n\n{text}\n\n" if text else ""
 
 
 def collect_relevent_function_scope(proj_dir, developer_intent, changed_functions, range=None):
@@ -1061,6 +1126,7 @@ def collect_relevent_function_scope(proj_dir, developer_intent, changed_function
                     src_path=src_path,
                     issue=developer_intent,
                     signals=signals,
+                    proj_dir=proj_dir,
                 )
 
             if ranked:
@@ -1167,6 +1233,8 @@ def _llm_check_spec_update(proj_dir, work_dir, idx, fqn, lang_key, comment_prefi
             "may need to be created for them.\n\n"
         )
 
+    knowledge_section = _domain_knowledge_prompt_section(work_dir)
+
     prompt_content = (
         "# Update Function Specification\n\n"
         "A modification is being applied to a codebase to achieve the developer intent "
@@ -1177,6 +1245,7 @@ def _llm_check_spec_update(proj_dir, work_dir, idx, fqn, lang_key, comment_prefi
         f"- Known callees of this function: {callee_hint}.\n\n"
         "## Developer intent\n\n"
         f"{developer_intent}\n\n"
+        f"{knowledge_section}"
         "## Current function source\n\n"
         f"```{lang_key}\n{source.strip()}\n```\n\n"
         "## Current [SPEC] block (this function's own behavioral specification)\n\n"
@@ -1231,6 +1300,8 @@ def _llm_check_caller_info_update(proj_dir, work_dir, idx, caller_fqn, callee_na
     Returns the parsed result dict — keys "info_updated" (bool) and "new_info" (str) — or
     None when the LLM produced nothing usable.
     """
+    knowledge_section = _domain_knowledge_prompt_section(work_dir)
+
     prompt_content = (
         "# Reconcile a Caller's [INFO] Block with a Changed Callee\n\n"
         f"The callee `{callee_name}`'s behavioral specification was just updated. The caller "
@@ -1240,6 +1311,7 @@ def _llm_check_caller_info_update(proj_dir, work_dir, idx, caller_fqn, callee_na
         "conflict (no contradictory pre/post-conditions). Leave the entries for every other "
         "callee unchanged.\n\n"
         f"Comment prefix for this language: `{comment_prefix}`.\n\n"
+        f"{knowledge_section}"
         "## Callee's updated [SPEC] block\n\n"
         f"{callee_new_spec}\n\n"
         "## Caller's current source\n\n"
@@ -1335,15 +1407,27 @@ def _opencode_generate_spec(proj_dir, work_dir, idx, fqn, lang_key, comment_pref
             caller_section += f"### According to {cfqn}\n\n{exp.strip()}\n\n"
 
     callee_hint = ", ".join(sorted(callee_names)) if callee_names else "(none)"
+    user_knowledge_paths = list_staged_domain_knowledge_relpaths(work_dir)
+    if user_knowledge_paths:
+        user_knowledge_step = (
+            "2. Read these user-provided domain knowledge Markdown files and use "
+            "them as additional context:\n"
+            f"{format_domain_knowledge_bullets(user_knowledge_paths)}\n"
+        )
+        step_offset = 1
+    else:
+        user_knowledge_step = ""
+        step_offset = 0
+    info_step_number = 3 + step_offset
     if callee_names:
         info_step = (
-            "3. Because this function has callees, also produce an [INFO] block recording the "
+            f"{info_step_number}. Because this function has callees, also produce an [INFO] block recording the "
             "expected behavioral spec of each callee it depends on (the `[INFO]` ... `[INFO]` "
             f"block only, markers included, every line prefixed with `{comment_prefix}`), and "
             "list the names of the callees you recorded.\n"
         )
     else:
-        info_step = "3. This function has no callees, so produce no [INFO] block.\n"
+        info_step = f"{info_step_number}. This function has no callees, so produce no [INFO] block.\n"
 
     prompt_content = (
         "# Generate Function Specification\n\n"
@@ -1361,11 +1445,12 @@ def _opencode_generate_spec(proj_dir, work_dir, idx, fqn, lang_key, comment_pref
         "## Steps\n\n"
         "1. Read `fm_agent/spec_prompts/system_prompt.md` for the exact [SPEC]/[INFO] format "
         "rules used by this project.\n"
-        "2. Produce the COMPLETE [SPEC] block describing this function's behavior — the "
+        f"{user_knowledge_step}"
+        f"{2 + step_offset}. Produce the COMPLETE [SPEC] block describing this function's behavior — the "
         "`[SPEC]` ... `[SPEC]` block only, markers included, every line prefixed with "
         f"`{comment_prefix}`, and NO source code.\n"
         f"{info_step}"
-        f"4. Write your answer to `{result_relpath}` as a JSON object with keys:\n"
+        f"{4 + step_offset}. Write your answer to `{result_relpath}` as a JSON object with keys:\n"
         '   - "spec_updated": boolean — true when you produced a [SPEC] block.\n'
         '   - "new_spec": string — the full [SPEC] block.\n'
         '   - "info_updated": boolean — true when you produced an [INFO] block.\n'
@@ -1381,7 +1466,11 @@ def _opencode_generate_spec(proj_dir, work_dir, idx, fqn, lang_key, comment_pref
         prompt_content,
         result_relpath,
         stage="generate_function_spec",
-        input_files=[prompt_relpath, "fm_agent/spec_prompts/system_prompt.md"],
+        input_files=[
+            prompt_relpath,
+            "fm_agent/spec_prompts/system_prompt.md",
+            *user_knowledge_paths,
+        ],
     )
 
 
@@ -1673,7 +1762,9 @@ def _update_specs_for_intent(proj_dir, work_dir, developer_intent, changed_funct
     return sorted(changed_spec_files)
 
 
-def _verify_incremental_functions(proj_dir, work_dir, changed_functions, updated_spec_files):
+def _verify_incremental_functions(
+    proj_dir, work_dir, changed_functions, updated_spec_files, submodules=None
+):
     """
     Step 10: re-run the verification stage (reasoner + bug validation) on only the functions
     whose implementation-vs-spec verdict may have drifted because of this modification.
@@ -1725,6 +1816,11 @@ def _verify_incremental_functions(proj_dir, work_dir, changed_functions, updated
         for path in verify_targets
         if os.path.exists(path)
     })
+    if submodules:
+        file_list = [
+            rel for rel in file_list
+            if _is_under_submodules(rel.replace(os.sep, "/"), submodules)
+        ]
     if not file_list:
         logging.info("    [verify] no functions require re-verification.")
         return []
