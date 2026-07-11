@@ -5,8 +5,9 @@ import sys
 import shutil
 import logging
 
-from src.file_utils import is_file_ready
-from src.languages.registry import batch_extract_all
+from src.file_utils import is_file_ready, _is_test_file
+from src.languages.codegraph import canonicalize
+from src.languages.registry import batch_extract_all, function_spans_for_file
 
 LANG_CONFIG = {
     "cpp": {
@@ -110,6 +111,19 @@ LANG_CONFIG = {
         },
         "body": "brace",
     },
+    "erlang": {
+        "comment_prefix": "%",
+        "spec_marker": "% [SPEC]",
+        "skip_prefixes": ("%", "-module", "-export", "-import", "-include"),
+        "skip_keywords_line": ("-record", "-type", "-spec", "-callback"),
+        "keywords": {
+            "after", "and", "andalso", "band", "begin", "bnot", "bor", "bsl",
+            "bsr", "bxor", "case", "catch", "cond", "div", "end", "fun", "if",
+            "let", "maybe", "not", "of", "or", "orelse", "receive", "rem",
+            "try", "when", "xor",
+        },
+        "body": "external",
+    },
     "cuda": {
         "comment_prefix": "//",
         "spec_marker": "// [SPEC]",
@@ -145,6 +159,7 @@ LANG_CONFIG = {
 EXT_TO_LANG = {
     "cpp": "cpp", "cc": "cpp", "cxx": "cpp", "c": "c", "h": "cpp", "hpp": "cpp",
     "py": "python",
+    "erl": "erlang",
     "go": "go",
     "rs": "rust",
     "java": "java",
@@ -154,65 +169,9 @@ EXT_TO_LANG = {
     "ets": "arkts",
 }
 
-# Directories that typically contain test code
-_TEST_DIR_NAMES = {
-    "test", "tests", "__tests__", "testing", "test_helpers",
-    "testdata", "testutils", "fixtures", "mocks",
-}
-
-# Regex patterns matching common test file naming conventions
-_TEST_FILE_PATTERNS = [
-    re.compile(r'^test_.*\.py$'),         # Python: test_foo.py
-    re.compile(r'^.*_test\.py$'),          # Python: foo_test.py
-    re.compile(r'^conftest\.py$'),         # pytest fixtures
-    re.compile(r'^.*_test\.go$'),          # Go: foo_test.go
-    re.compile(r'^.*_test\.(?:cpp|cc|cxx|c|h|hpp)$'),  # C/C++: foo_test.cpp
-    re.compile(r'^test_.*\.(?:cpp|cc|cxx|c|h|hpp)$'),  # C/C++: test_foo.cpp
-    re.compile(r'^.*Test(?:s|Case)?\.java$'),            # Java: FooTest.java
-    re.compile(r'^.*\.(?:test|spec)\.(?:js|jsx|ts|tsx)$'),  # JS/TS: foo.test.js
-    re.compile(r'^.*_test\.rs$'),          # Rust: foo_test.rs
-    re.compile(r'^.*\.test\.(?:ets)$'),    # ArkTS: foo.test.ets
-]
-
-
-# Project-relative paths that must never be treated as test files, even when
-# their path matches the heuristics below. The entry pipeline registers the
-# source file holding its entry_func here so that file is still extracted and
-# reasoned about even if it lives in a test directory or is named like a test.
-_TEST_FILE_EXEMPTIONS = set()
-
-
-def add_test_file_exemption(rel_path):
-    """Exempt a project-relative source path from the test-file heuristics."""
-    _TEST_FILE_EXEMPTIONS.add(rel_path.replace('\\', '/'))
-
-
-def clear_test_file_exemptions():
-    """Drop all registered test-file exemptions."""
-    _TEST_FILE_EXEMPTIONS.clear()
-
-
-def _is_test_file(rel_path):
-    """Return True if the relative source path looks like a test file."""
-    norm_path = rel_path.replace('\\', '/')
-    if norm_path in _TEST_FILE_EXEMPTIONS:
-        return False
-    parts = norm_path.split('/')
-    # Check if any directory component is a known test directory
-    for part in parts[:-1]:
-        if part.lower() in _TEST_DIR_NAMES:
-            return True
-    # Check filename against test patterns
-    basename = parts[-1]
-    for pat in _TEST_FILE_PATTERNS:
-        if pat.match(basename):
-            return True
-    return False
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
 
 def _safe_filename(name: str, ext: str) -> str:
     """Return a safe filename from a function name and extension.
@@ -247,6 +206,15 @@ def _strip_angle_brackets(text):
 def _extract_func_name_brace(signature_text, lang_cfg):
     """Extract the function name from a brace-delimited language signature."""
     lang_keywords = lang_cfg["keywords"]
+
+    m = re.search(
+        r'\b(operator\s*(?:\[\]|\(\)|[+\-*/%&|^~!=<>]+|new(?:\s*\[\s*\])?|delete(?:\s*\[\s*\])?))'
+        r'\s*\(',
+        signature_text,
+    )
+    if m:
+        return m.group(1)
+
     cleaned = _strip_angle_brackets(signature_text)
     for m in re.finditer(r'\b(\w+)\s*\(', cleaned):
         name = m.group(1)
@@ -641,23 +609,71 @@ def extract_functions_from_file(filepath, lang_key):
 
     if lang_cfg["body"] == "brace":
         raw_funcs = _extract_functions_brace(lines, lang_key, lang_cfg)
-    else:
+    elif lang_cfg["body"] == "indent":
         raw_funcs = _extract_functions_indent(lines, lang_cfg)
+    else:
+        # Semantic-only languages (currently Erlang) are extracted by their
+        # registered backend and have no reliable file-local fallback.
+        return []
 
-    # Deduplicate names
+    # Deduplicate names (applied after canonicalize so operator overloads
+    # produce safe filenames and FQN components).
     name_counts = {}
     results = []
     for name, start, end in raw_funcs:
-        count = name_counts.get(name, 0)
-        name_counts[name] = count + 1
+        cname = canonicalize(name)
+        count = name_counts.get(cname, 0)
+        name_counts[cname] = count + 1
         if count > 0:
-            deduped = f"{name}_{count}"
+            deduped = f"{cname}_{count}"
         else:
-            deduped = name
+            deduped = cname
         source = '\n'.join(lines[start:end + 1]) + '\n'
         results.append((deduped, source))
 
     return results
+
+
+def _function_spans(filepath, lang_key, proj_dir=None):
+    """Return ``(spans, raw_lines)`` for a source file.
+
+    ``spans`` is a list of ``(deduped_name, start_idx, end_idx)`` line ranges,
+    one per function, named exactly as run_extraction names the extracted files
+    (duplicate names get ``_1``, ``_2``, ... suffixes). ``raw_lines`` are the
+    file's original lines (newline characters preserved) so callers can rewrite
+    the file by line index.
+
+    Function boundaries come from codegraph via the language registry when
+    ``proj_dir`` is given and codegraph indexes the file; otherwise they fall
+    back to the regex extractor (_extract_functions_brace / _indent). Both
+    backends yield the same (name, start_idx, end_idx) shape, so the dedup
+    naming below is identical regardless of which one is used.
+    """
+    lang_cfg = LANG_CONFIG[lang_key]
+    with open(filepath, "r", errors="replace") as f:
+        raw_lines = f.readlines()
+    # Extraction operates on newline-stripped lines; indices line up 1:1 with
+    # raw_lines (readlines yields one entry per line).
+    norm_lines = [l.rstrip("\n").rstrip("\r") for l in raw_lines]
+
+    raw_funcs = None
+    if proj_dir is not None:
+        raw_funcs = function_spans_for_file(proj_dir, filepath, lang_key)
+    if raw_funcs is None:
+        if lang_cfg["body"] == "brace":
+            raw_funcs = _extract_functions_brace(norm_lines, lang_key, lang_cfg)
+        else:
+            raw_funcs = _extract_functions_indent(norm_lines, lang_cfg)
+
+    name_counts = {}
+    spans = []
+    for name, start, end in raw_funcs:
+        cname = canonicalize(name)
+        count = name_counts.get(cname, 0)
+        name_counts[cname] = count + 1
+        deduped = cname if count == 0 else f"{cname}_{count}"
+        spans.append((deduped, start, end))
+    return spans, raw_lines
 
 
 def run_extraction(proj_dir, work_dir=None, force=False, verbose=False):
@@ -679,6 +695,10 @@ def run_extraction(proj_dir, work_dir=None, force=False, verbose=False):
         phases_data = json.load(f)
 
     registry_funcs, registry_langs = batch_extract_all(proj_dir)
+    registry_funcs = {
+        os.path.normcase(os.path.normpath(path)): funcs
+        for path, funcs in registry_funcs.items()
+    }
 
     # Build source file list from phases.json
     source_files = []
@@ -721,8 +741,9 @@ def run_extraction(proj_dir, work_dir=None, force=False, verbose=False):
             dir_name = src_base
         out_dir = os.path.join(output_base, src_dir, dir_name) if src_dir else os.path.join(output_base, dir_name)
 
-        if src_path in registry_funcs:
-            funcs = registry_funcs[src_path]
+        registry_key = os.path.normcase(os.path.normpath(src_path))
+        if registry_key in registry_funcs:
+            funcs = registry_funcs[registry_key]
         else:
             funcs = extract_functions_from_file(src_path, lang_key)
         if not funcs:
