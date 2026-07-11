@@ -9,9 +9,34 @@ from .trace_writer import (
 
 
 def _load_spec_check_json(response):
-    """Load a complete, strict JSON response from the specification checker."""
+    """Load the only JSON object from strict, fenced, or prose-wrapped output."""
     text = (response or "").strip()
-    return json.loads(text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as direct_exc:
+        decoder = json.JSONDecoder()
+        json_objects = []
+        index = 0
+        while index < len(text):
+            start = text.find("{", index)
+            if start == -1:
+                break
+            try:
+                data, consumed = decoder.raw_decode(text[start:])
+            except json.JSONDecodeError:
+                index = start + 1
+                continue
+            if isinstance(data, dict):
+                json_objects.append(data)
+            index = start + consumed
+
+        if len(json_objects) == 1:
+            return json_objects[0]
+        if len(json_objects) > 1:
+            raise json.JSONDecodeError(
+                "spec-check response contains multiple JSON objects", text, 0
+            )
+        raise direct_exc
 
 def _parse_spec_check_json(response):
     """Parse and validate the spec-check model structured JSON verdict."""
