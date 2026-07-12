@@ -2,12 +2,14 @@ import os
 import sys
 import glob
 import json
+import re
 import time
 import shutil
 import logging
 import subprocess
 import tempfile
 import concurrent.futures
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
@@ -21,6 +23,7 @@ from config import (
 from .extract import (
     EXT_TO_LANG,
     LANG_CONFIG,
+    _function_spans,
     extract_functions_from_file,
     run_extraction,
 )
@@ -401,6 +404,40 @@ def _collect_changed_functions(proj_dir, old_commit_id, submodules=None):
     return result
 
 
+def _src_rel_to_func_dir(proj_dir, abs_src):
+    """(func_dir, ext) for a source file: the extracted-functions directory that
+    holds its functions (``.../loader-cpp``) and the source extension."""
+    extracted_base = os.path.join(proj_dir, "fm_agent", "extracted_functions")
+    rel = os.path.relpath(abs_src, proj_dir)
+    src_dir = os.path.dirname(rel)
+    src_base = os.path.basename(rel)
+    last_dot = src_base.rfind(".")
+    if last_dot > 0:
+        dir_name = src_base[:last_dot] + "-" + src_base[last_dot + 1:]
+        ext = src_base[last_dot + 1:]
+    else:
+        dir_name = src_base
+        ext = ""
+    func_dir = os.path.join(extracted_base, src_dir, dir_name) if src_dir else os.path.join(extracted_base, dir_name)
+    return func_dir, ext
+
+
+def _extracted_files_by_method(func_dir):
+    """``{method_stem: [abs_path, ...]}`` for every extracted-function file under
+    ``func_dir``, walked recursively. The key is the file's stem (its final path
+    component minus extension), so a source-level name (which the regex change
+    detector reports without a class) matches both a free function
+    (``func_dir/foo.ext``) and a class member (``func_dir/Class/foo.ext``)."""
+    index = defaultdict(list)
+    if not os.path.isdir(func_dir):
+        return index
+    for root, _dirs, fnames in os.walk(func_dir):
+        for fn in fnames:
+            stem = fn[: fn.rfind(".")] if "." in fn else fn
+            index[stem].append(os.path.join(root, fn))
+    return index
+
+
 def _modified_function_targets(
     proj_dir, modified_functions, classes=("added", "removed", "modified")
 ):
@@ -409,57 +446,74 @@ def _modified_function_targets(
 
     modified_functions is the mapping returned by _collect_changed_functions: an
     absolute source-file path -> {"added", "removed", "modified"} lists of function
-    names. For each (file, name) pair whose change class is in classes, this computes
-    the FQN used by the call graph and the path of the function's file under
-    proj_dir/fm_agent/extracted_functions/, both matching that layout (the source
-    file's final dot becomes a hyphen and path components are joined with "::"), e.g.
-    an "load" function in "<proj_dir>/src/engine/loader.cpp" -> FQN
-    "src::engine::loader-cpp::load" at ".../extracted_functions/src/engine/loader-cpp/load.cpp".
+    names, which the regex change detector reports without a class (``Flush``,
+    ``Flush_1``). The extracted files, however, live under a class subdirectory
+    when codegraph qualifies members (``.../storage-cpp/LocalStorage/Flush.cpp``),
+    so we do not reconstruct a flat path from the name — we walk the function
+    directory and match each changed name against the actual files by method stem
+    (tolerating the regex dedup suffix). When two classes in one file share a
+    method name, a changed bare name maps to both members; that is a safe
+    over-approximation for the callers (spec/verify seeds).
 
     Returns a dict mapping FQN -> absolute extracted-file path.
     """
-    extracted_base = os.path.join(proj_dir, "fm_agent", "extracted_functions")
+    work_dir = os.path.join(proj_dir, "fm_agent")
     targets = {}
     for abs_src, changes in modified_functions.items():
-        rel = os.path.relpath(abs_src, proj_dir)
-        src_dir = os.path.dirname(rel)
-        src_base = os.path.basename(rel)
-        last_dot = src_base.rfind(".")
-        if last_dot > 0:
-            dir_name = src_base[:last_dot] + "-" + src_base[last_dot + 1:]
-            ext = src_base[last_dot + 1:]
-        else:
-            dir_name = src_base
-            ext = ""
-        func_dir = os.path.join(extracted_base, src_dir, dir_name) if src_dir else os.path.join(extracted_base, dir_name)
+        func_dir, _ext = _src_rel_to_func_dir(proj_dir, abs_src)
+        by_method = _extracted_files_by_method(func_dir)
         names = set()
         for cls in classes:
             names.update(changes.get(cls, []))
         for name in names:
-            fname = f"{name}.{ext}" if ext else name
-            path = os.path.join(func_dir, fname)
-            fqn = _file_to_fqn(path, os.path.join(proj_dir, "fm_agent"))
-            targets[fqn] = path
+            paths = list(by_method.get(name, ()))
+            if not paths:
+                # The regex extractor disambiguates same-name funcs as foo/foo_1;
+                # codegraph uses the class dir instead, so fall back to the stem.
+                stem = re.sub(r"_\d+$", "", name)
+                paths = by_method.get(stem, ())
+            for path in paths:
+                targets[_file_to_fqn(path, work_dir)] = path
     return targets
 
 
 def _remove_stale_extracted(proj_dir, modified_functions):
     """
-    Delete extracted-function files for functions reported as removed (including every
-    function of a deleted source file), and prune any function directory left empty as
-    a result. Re-extraction never rewrites these files, so without this they linger as
-    stale specs under fm_agent/extracted_functions/.
+    Delete extracted-function files that no longer correspond to a function in the
+    current source, for every changed source file, and prune any directory left
+    empty. Rather than reconstructing removed functions' paths from their (regex,
+    class-less) names — which cannot address a specific class member — we reconcile
+    each changed file's function directory against the set codegraph now produces
+    for it (re-extraction and the index rebuild have already run at this point):
+    any extracted file not in that valid set is stale and removed. A deleted source
+    file yields an empty valid set, so all of its extracted files are removed.
     """
-    removed = _modified_function_targets(
-        proj_dir, modified_functions, classes=("removed",)
-    )
-    for path in removed.values():
-        if os.path.isfile(path):
-            os.remove(path)
-    for path in removed.values():
-        func_dir = os.path.dirname(path)
-        if os.path.isdir(func_dir) and not os.listdir(func_dir):
-            os.rmdir(func_dir)
+    for abs_src in modified_functions:
+        func_dir, ext = _src_rel_to_func_dir(proj_dir, abs_src)
+        if not os.path.isdir(func_dir):
+            continue
+
+        valid = set()
+        lang_key = EXT_TO_LANG.get(ext)
+        if lang_key and os.path.isfile(abs_src):
+            spans, _raw = _function_spans(abs_src, lang_key, proj_dir)
+            for ident, _s, _e in spans:
+                # ident is the class-qualified, deduped identifier written by
+                # run_extraction; "::" maps to the class subdirectory layout.
+                parts = ident.split("::")
+                path = os.path.join(func_dir, *parts) + (f".{ext}" if ext else "")
+                valid.add(os.path.abspath(path))
+
+        for root, _dirs, fnames in os.walk(func_dir):
+            for fn in fnames:
+                abs_path = os.path.abspath(os.path.join(root, fn))
+                if abs_path not in valid:
+                    os.remove(abs_path)
+
+        # Prune empty directories left behind (deepest first).
+        for root, dirs, _files in os.walk(func_dir, topdown=False):
+            if root != func_dir and os.path.isdir(root) and not os.listdir(root):
+                os.rmdir(root)
 
 
 def _extract_leading_spec_comments(content, comment_prefix, spec_marker):
@@ -1131,9 +1185,15 @@ def collect_relevent_function_scope(proj_dir, developer_intent, changed_function
 
             if ranked:
                 # Keep the extracted-function file for each selected function name.
+                # scope.py reports class-less names, but members live under a class
+                # subdirectory, so match against the actual files by method stem
+                # (a same-name method in two classes keeps both — safe for scope).
+                by_method = _extracted_files_by_method(func_dir)
                 for f in ranked:
-                    cand = os.path.join(func_dir, f"{f['name']}.{ext}")
-                    if os.path.isfile(cand):
+                    cands = by_method.get(f["name"]) or by_method.get(
+                        re.sub(r"_\d+$", "", f["name"]), []
+                    )
+                    for cand in cands:
                         _record(os.path.relpath(cand, extracted_dir), f.get("score", 0.0))
                 logging.info(
                     "    [scope] pass 3/3: %s -> %s",
@@ -1141,11 +1201,13 @@ def collect_relevent_function_scope(proj_dir, developer_intent, changed_function
                     ", ".join(f"{f['name']}={f.get('score', 0.0):.2f}" for f in ranked),
                 )
             else:
-                # scope.py could not localize within this file — keep all of its functions.
-                for fname in os.listdir(func_dir):
-                    cand = os.path.join(func_dir, fname)
-                    if os.path.isfile(cand):
-                        _record(os.path.relpath(cand, extracted_dir), 0.0)
+                # scope.py could not localize within this file — keep all of its
+                # functions, walking recursively so nested class members are kept.
+                for root, _dirs, fnames in os.walk(func_dir):
+                    for fname in fnames:
+                        cand = os.path.join(root, fname)
+                        if os.path.isfile(cand):
+                            _record(os.path.relpath(cand, extracted_dir), 0.0)
 
     # Order by descending relevance score (path as a deterministic tie-breaker), then keep
     # only the first `range` functions when a limit is given.
