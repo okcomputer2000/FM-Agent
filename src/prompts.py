@@ -1,6 +1,11 @@
 from config import *
 import json
-from .llm_client import _llm_provider_client, _retry_create, _llm_json_call
+from .llm_client import (
+    _llm_provider_client,
+    _retry_create,
+    _llm_json_call,
+    _parse_json_response,
+)
 from .trace_writer import (
     new_event_id,
     record_llm_exchange,
@@ -9,34 +14,20 @@ from .trace_writer import (
 
 
 def _load_spec_check_json(response):
-    """Load the only JSON object from strict, fenced, or prose-wrapped output."""
-    text = (response or "").strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError as direct_exc:
-        decoder = json.JSONDecoder()
-        json_objects = []
-        index = 0
-        while index < len(text):
-            start = text.find("{", index)
-            if start == -1:
-                break
-            try:
-                data, consumed = decoder.raw_decode(text[start:])
-            except json.JSONDecodeError:
-                index = start + 1
-                continue
-            if isinstance(data, dict):
-                json_objects.append(data)
-            index = start + consumed
+    """Load a single JSON object from a specification-check response.
 
-        if len(json_objects) == 1:
-            return json_objects[0]
-        if len(json_objects) > 1:
-            raise json.JSONDecodeError(
-                "spec-check response contains multiple JSON objects", text, 0
-            )
-        raise direct_exc
+    The shared parser handles direct, fenced, and prose-wrapped structured
+    responses.  This adapter retains the spec-checker's object-only contract
+    and its ``JSONDecodeError`` failure type.
+    """
+    text = response.strip() if isinstance(response, str) else ""
+    try:
+        data = _parse_json_response(response)
+    except ValueError as exc:
+        raise json.JSONDecodeError(str(exc), text, 0) from exc
+    if not isinstance(data, dict):
+        raise json.JSONDecodeError("spec-check response must contain a JSON object", text, 0)
+    return data
 
 def _parse_spec_check_json(response):
     """Parse and validate the spec-check model structured JSON verdict."""

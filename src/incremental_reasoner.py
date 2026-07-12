@@ -943,11 +943,12 @@ def _validate_caller_info_update(data):
 
 def _llm_select_json(work_dir, prompt_content, stage, validator, schema_description,
                      trace_meta=None):
-    """Run a direct LLM call and return validated, strict JSON.
+    """Run a direct LLM call and return validated structured JSON.
 
     This is for self-contained prompts whose context is already inlined. The
-    shared JSON caller records the raw exchange, rejects Markdown/prose-wrapped
-    output, validates the required fields, and retries on protocol failures.
+    shared JSON caller records the raw exchange, accepts exactly one JSON
+    object or array (including a fenced or prose-wrapped one), validates the
+    required fields, and retries on protocol failures.
     """
     messages = [{"role": "user", "content": prompt_content}]
     meta = {"stage": stage, "summary": f"LLM {stage}", **(trace_meta or {})}

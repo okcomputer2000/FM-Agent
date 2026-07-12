@@ -46,7 +46,6 @@ from __future__ import annotations
 
 import ast
 from difflib import SequenceMatcher
-import json
 import logging
 import re
 import time
@@ -66,6 +65,7 @@ from .extract import (
     LANG_CONFIG,
     _function_spans,
 )
+from .llm_client import _parse_json_response
 
 logger = logging.getLogger(__name__)
 
@@ -538,7 +538,7 @@ def _llm_rerank(funcs_info: list[dict],
                 temperature=0.0,
             )
             text = response.choices[0].message.content.strip()
-            names = json.loads(text)
+            names = _parse_json_response(text)
             if not isinstance(names, list) or not all(
                 isinstance(name, str) and name.strip() for name in names
             ):

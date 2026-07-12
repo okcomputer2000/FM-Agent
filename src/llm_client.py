@@ -233,23 +233,50 @@ def _retry_create(client, model, messages):
 
 
 def _parse_json_response(response):
-    """Parse a complete LLM response as strict JSON.
+    """Parse the only JSON object or array in an LLM response.
 
-    Direct LLM prompts in FM-Agent ask for a machine-readable response. Do not
-    recover JSON from prose or Markdown here: accepting a substring would make a
-    malformed response appear valid and hide prompt/protocol regressions.
+    Prefer a complete JSON response, but tolerate Markdown fences or explanatory
+    prose when they surround exactly one valid structured JSON value. Multiple
+    structured values are rejected because choosing one would be ambiguous.
     """
     if not isinstance(response, str):
         raise ValueError("LLM response must be a JSON string")
+    text = response.strip()
     try:
-        return json.loads(response.strip())
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"LLM response is not valid JSON: {exc}") from exc
+        data = json.loads(text)
+    except json.JSONDecodeError as direct_exc:
+        decoder = json.JSONDecoder()
+        values = []
+        index = 0
+        while index < len(text):
+            object_start = text.find("{", index)
+            array_start = text.find("[", index)
+            starts = [start for start in (object_start, array_start) if start != -1]
+            if not starts:
+                break
+            start = min(starts)
+            try:
+                data, end = decoder.raw_decode(text, start)
+            except json.JSONDecodeError:
+                index = start + 1
+                continue
+            if isinstance(data, (dict, list)):
+                values.append(data)
+            index = end
 
+        if len(values) == 1:
+            return values[0]
+        if len(values) > 1:
+            raise ValueError("LLM response contains multiple JSON values")
+        raise ValueError(f"LLM response is not valid JSON: {direct_exc}") from direct_exc
+
+    if not isinstance(data, (dict, list)):
+        raise ValueError("LLM response must contain a JSON object or array")
+    return data
 
 def _llm_json_call(client, model, messages, validator, schema_description,
                    max_retries=MAX_SPC_ITER, trace_dir=None, trace_meta=None):
-    """Call an LLM until it returns strict JSON accepted by ``validator``.
+    """Call an LLM until it returns structured JSON accepted by ``validator``.
 
     ``validator`` receives the parsed JSON value and must either return the
     desired Python value or raise ``ValueError`` with a schema error. Keeping
