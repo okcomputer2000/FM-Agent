@@ -48,10 +48,14 @@ def _collect_phase_files(proj_dir, phase_data):
             if not os.path.isdir(func_dir):
                 continue
 
-            for fname in os.listdir(func_dir):
-                fpath = os.path.join(func_dir, fname)
-                if os.path.isfile(fpath):
-                    results.append((fpath, module_name))
+            # Walk recursively: member functions are nested one level deeper under
+            # a class directory ("<file>-cpp/LocalStorage/Flush.cpp"), while free
+            # functions sit directly in func_dir.
+            for root, _dirs, fnames in os.walk(func_dir):
+                for fname in fnames:
+                    fpath = os.path.join(root, fname)
+                    if os.path.isfile(fpath):
+                        results.append((fpath, module_name))
 
     return results
 
