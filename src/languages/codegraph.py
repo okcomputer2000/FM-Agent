@@ -8,12 +8,73 @@ To add support for a new language: create src/languages/<lang>.py and add an ent
 REGISTRY in src/languages/registry.py. No other files need to change.
 """
 
+import hashlib
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
 from collections import defaultdict
+
+
+_SAFE_REPLACE = str.maketrans({"/": "_"})
+_UNSAFE = set("/")
+
+
+def canonicalize(func_name):
+    """Return a filesystem-safe, FQN-safe version of a function name.
+
+    C++ operator overloads like ``operator/`` contain ``/`` which breaks both
+    file paths and ``::``-separated FQNs.  This function sanitises those
+    characters so the name is safe everywhere it appears: extracted-function
+    file names, FQNs, call-edge keys, and scope.py rankings.
+
+    Every entry point that introduces a function name into the system MUST call
+    this function before using the name.
+    """
+    if not func_name:
+        return func_name
+    for ch in _UNSAFE:
+        if ch in func_name:
+            return func_name.translate(_SAFE_REPLACE)
+    return func_name
+
+def _bare_function_name(name: str) -> str:
+    """Extract the bare function identifier from a potentially decorated name.
+
+    Tree-sitter sometimes stores a full function signature in the name column
+    for macro-generated C/C++ declarations (e.g. ``(*func)(type *param)``
+    instead of ``func``).  Strips decorations so the result can be used as a
+    filename stem and call-edge key.
+
+    Handled patterns (language-agnostic):
+    - Simple identifier: ``"my_func"`` -> ``"my_func"``
+    - Qualified name: ``"ns::Cls::method"`` -> ``"method"``
+    - Go pointer receiver: ``"(*T).Method"`` -> ``"Method"``
+    - Function-pointer: ``"(*func)(type *param)"`` -> ``"func"``
+    - Pointer return: ``"*func_name(...)"`` -> ``"func_name"``
+    - this-dot: ``"this.onClick"`` -> ``"onClick"``
+    - Empty: ``""`` -> ``""`` (caller falls back to ``_function``)
+    """
+    name = name.strip()
+    if not name:
+        return ""
+
+    m = re.search(r'(?:[:\.)])(\w+)$', name)
+    if m:
+        return m.group(1)
+    m = re.match(r'\(\s*\*\s*(\w+)\s*\)', name)
+    if m:
+        return m.group(1)
+    m = re.match(r'\*\s*(\w+)', name)
+    if m:
+        return m.group(1)
+    m = re.match(r'^(\w+)', name)
+    if m:
+        return m.group(1)
+    return name
+
 
 # Maps FM-Agent lang_key → the language string stored in codegraph's SQLite
 # nodes.language column. Only includes languages that codegraph actually supports.
@@ -93,10 +154,12 @@ def _node_fqn_map(cur, cg_langs) -> dict:
     counts: dict = {}
     result: dict = {}
     for node_id, name, file_path, _start in cur.fetchall():
-        key = (file_path, name)
+        bare = _bare_function_name(name)
+        cname = canonicalize(bare)
+        key = (file_path, cname)
         c = counts.get(key, 0)
         counts[key] = c + 1
-        deduped = name if c == 0 else f"{name}_{c}"
+        deduped = cname if c == 0 else f"{cname}_{c}"
         result[node_id] = _fqn_for(file_path, deduped)
     return result
 
@@ -163,8 +226,8 @@ class CodeGraphExtractor:
             except OSError:
                 continue
 
-            file_funcs = []
             name_counts = {}
+            file_funcs = []
             for name, start_line, end_line in funcs:
                 # Disambiguate functions sharing a name within one file
                 # (LocalStorage::Flush vs RemoteCache::Flush, overloads, a method
@@ -175,9 +238,11 @@ class CodeGraphExtractor:
                 # both extraction and the call graph. Mirror the regex path's
                 # dedup ("Flush", "Flush_1", ...). funcs are line-ordered (SQL
                 # ORDER BY start_line), so suffix assignment is deterministic.
-                count = name_counts.get(name, 0)
-                name_counts[name] = count + 1
-                deduped = name if count == 0 else f"{name}_{count}"
+                bare = _bare_function_name(name)
+                cname = canonicalize(bare)
+                count = name_counts.get(cname, 0)
+                name_counts[cname] = count + 1
+                deduped = cname if count == 0 else f"{cname}_{count}"
                 # codegraph uses 1-indexed lines, end_line is inclusive
                 body_lines = all_lines[start_line - 1 : end_line]
                 body = "".join(body_lines)
@@ -231,7 +296,7 @@ class CodeGraphExtractor:
         if not rows:
             return None
         # codegraph uses 1-indexed lines with an inclusive end_line.
-        return [(name, int(start) - 1, int(end) - 1) for name, start, end in rows]
+        return [(canonicalize(_bare_function_name(name)), int(start) - 1, int(end) - 1) for name, start, end in rows]
 
     def get_call_edges(self, lang_key: str) -> dict:
         """Return {caller_fqn: {callee_fqn, ...}} for the given language.

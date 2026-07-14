@@ -219,6 +219,8 @@ def run_entry_pipeline(
     entry_func=None,
     end_funcs=None,
     resume=False,
+    domain_knowledge_files=None,
+    one_phase=False,
     extra_call_edges_path=None,
 ):
     """Run the entry-point-scoped reasoning pipeline.
@@ -252,6 +254,7 @@ def run_entry_pipeline(
             restriction is applied and the whole call graph reachable from
             ``entry_func`` is selected.
         resume: forwarded directly to the standard pipeline.
+        one_phase: forwarded directly to the standard pipeline.
         extra_call_edges_path: optional file containing supplemental caller/callee
             edges used for entry reachability and later top-down layer generation.
     """
@@ -275,7 +278,9 @@ def run_entry_pipeline(
             entry_func,
             end_funcs,
             resume,
-            extra_call_edges_path,
+            domain_knowledge_files=domain_knowledge_files,
+            one_phase=one_phase,
+            extra_call_edges_path=extra_call_edges_path,
         )
     finally:
         clear_test_file_exemptions()
@@ -420,7 +425,9 @@ def _run_entry_pipeline_inner(
     entry_func,
     end_funcs,
     resume,
-    extra_call_edges_path,
+    domain_knowledge_files=None,
+    one_phase=False,
+    extra_call_edges_path=None,
 ):
     """Body of run_entry_pipeline; runs with the entry source file exempted."""
     # 1. Selection: extract fresh into a temp workspace and build the call graph.
@@ -464,6 +471,8 @@ def _run_entry_pipeline_inner(
             run_dir,
             resume=resume,
             required_source_files=[_entry_func_source_rel(entry_func)],
+            domain_knowledge_files=domain_knowledge_files,
+            one_phase=one_phase,
             extra_call_edges_path=extra_call_edges_path,
         )
     finally:

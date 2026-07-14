@@ -6,6 +6,7 @@ import shutil
 import logging
 
 from src.file_utils import is_file_ready, _is_test_file
+from src.languages.codegraph import canonicalize
 from src.languages.registry import batch_extract_all, function_spans_for_file
 
 LANG_CONFIG = {
@@ -172,6 +173,19 @@ EXT_TO_LANG = {
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _safe_filename(name: str, ext: str) -> str:
+    """Return a safe filename from a function name and extension.
+
+    Replaces "/" (directory separator) with "_" and falls back to
+    "_function" for empty names.  Does *not* strip leading or trailing
+    underscores so that names like __init__ and _private stay consistent
+    with codegraph call-edge keys and FQN resolution.
+    """
+    safe = name.replace('/', '_')
+    if not safe:
+        safe = "_function"
+    return f"{safe}.{ext}"
+
 
 def _strip_angle_brackets(text):
     """Remove balanced <...> segments from text (for template parameters)."""
@@ -192,6 +206,15 @@ def _strip_angle_brackets(text):
 def _extract_func_name_brace(signature_text, lang_cfg):
     """Extract the function name from a brace-delimited language signature."""
     lang_keywords = lang_cfg["keywords"]
+
+    m = re.search(
+        r'\b(operator\s*(?:\[\]|\(\)|[+\-*/%&|^~!=<>]+|new(?:\s*\[\s*\])?|delete(?:\s*\[\s*\])?))'
+        r'\s*\(',
+        signature_text,
+    )
+    if m:
+        return m.group(1)
+
     cleaned = _strip_angle_brackets(signature_text)
     for m in re.finditer(r'\b(\w+)\s*\(', cleaned):
         name = m.group(1)
@@ -593,16 +616,18 @@ def extract_functions_from_file(filepath, lang_key):
         # registered backend and have no reliable file-local fallback.
         return []
 
-    # Deduplicate names
+    # Deduplicate names (applied after canonicalize so operator overloads
+    # produce safe filenames and FQN components).
     name_counts = {}
     results = []
     for name, start, end in raw_funcs:
-        count = name_counts.get(name, 0)
-        name_counts[name] = count + 1
+        cname = canonicalize(name)
+        count = name_counts.get(cname, 0)
+        name_counts[cname] = count + 1
         if count > 0:
-            deduped = f"{name}_{count}"
+            deduped = f"{cname}_{count}"
         else:
-            deduped = name
+            deduped = cname
         source = '\n'.join(lines[start:end + 1]) + '\n'
         results.append((deduped, source))
 
@@ -643,9 +668,10 @@ def _function_spans(filepath, lang_key, proj_dir=None):
     name_counts = {}
     spans = []
     for name, start, end in raw_funcs:
-        count = name_counts.get(name, 0)
-        name_counts[name] = count + 1
-        deduped = name if count == 0 else f"{name}_{count}"
+        cname = canonicalize(name)
+        count = name_counts.get(cname, 0)
+        name_counts[cname] = count + 1
+        deduped = cname if count == 0 else f"{cname}_{count}"
         spans.append((deduped, start, end))
     return spans, raw_lines
 
@@ -727,7 +753,7 @@ def run_extraction(proj_dir, work_dir=None, force=False, verbose=False):
         os.makedirs(out_dir, exist_ok=True)
 
         for func_name, func_source in funcs:
-            out_file = os.path.join(out_dir, f"{func_name}.{ext}")
+            out_file = os.path.join(out_dir, _safe_filename(func_name, ext))
 
             # Skip only when the file already has both [SPEC] and [INFO] blocks
             if not force and os.path.exists(out_file) and is_file_ready(out_file):

@@ -2,7 +2,6 @@ from config import (
     MAX_WORKERS,
     OPENCODE_MAX_RETRIES,
     OPENCODE_SPEC_MODEL,
-    OPENCODE_MODEL_PROVIDER,
 )
 from src.entry_reasoning_pipeline import run_entry_pipeline
 from src.call_graph_edges import load_call_edges
@@ -11,8 +10,11 @@ from src.file_utils import (
     is_file_ready,
     _has_source_code,
     _get_phase_files,
+    _get_all_phase_files,
+    _write_file_names,
     _json_file_is_valid,
     _get_incomplete_verification_files,
+    _is_under_submodules,
 )
 from src.verification import streaming_reasoner
 from src.extract import run_extraction, EXT_TO_LANG
@@ -21,7 +23,7 @@ from src.opencode_trace import (
     function_id_from_extracted_path,
     run_opencode_traced,
 )
-from src.cli_backend import build_agent_command, is_cli_backend_enabled
+from src.llm_client import build_llm_cli_command
 from src.incremental_reasoner import run_incremental_pipeline
 from src.git import (
     frozen_worktree,
@@ -33,6 +35,11 @@ from src.languages.codegraph import try_codegraph_init
 from src.pipeline_setup import (
     _run_setup_extract,
 )
+from src.domain_knowledge import (
+    collect_domain_knowledge_paths,
+    list_staged_domain_knowledge_relpaths,
+    stage_domain_knowledge_files,
+)
 import os
 import sys
 import argparse
@@ -43,6 +50,7 @@ import subprocess
 import logging
 import contextlib
 import concurrent.futures
+
 
 def _clean_previous_run(work_dir):
     """Remove the fm_agent working directory from the previous pipeline run."""
@@ -60,6 +68,43 @@ def _get_pending_batches(batches, proj_dir):
                 pending.append(batch)
                 break
     return pending
+
+
+def _normalize_submodules(proj_dir, submodules):
+    """Return validated project-relative submodule directories."""
+    if not submodules:
+        return []
+
+    proj_dir = os.path.abspath(proj_dir)
+    normalized = []
+    seen = set()
+    for raw in submodules:
+        value = (raw or "").strip()
+        if not value:
+            continue
+        candidate = value if os.path.isabs(value) else os.path.join(proj_dir, value)
+        candidate = os.path.abspath(candidate)
+        try:
+            inside_project = os.path.commonpath([proj_dir, candidate]) == proj_dir
+        except ValueError:
+            inside_project = False
+        if not inside_project or candidate == proj_dir:
+            raise ValueError(
+                f"--submodule must name subdirectories inside proj_dir, got: {raw}"
+            )
+        if not os.path.isdir(candidate):
+            raise ValueError(f"--submodule path is not a directory: {raw}")
+
+        rel = os.path.relpath(candidate, proj_dir).replace(os.sep, "/")
+        if rel not in seen:
+            normalized.append(rel)
+            seen.add(rel)
+
+    collapsed = []
+    for rel in sorted(normalized, key=lambda path: (path.count("/"), path)):
+        if not collapsed or not _is_under_submodules(rel, collapsed):
+            collapsed.append(rel)
+    return collapsed
 
 
 def _run_spec_generation_batch(
@@ -98,20 +143,12 @@ def _run_spec_generation_batch(
             f"Read fm_agent/spec_prompts/system_prompt.md for the format rules. {fm_reminder}"
         )
     prompt_file = os.path.join(proj_dir, "fm_agent", "workflow_spec_step4_batch.md")
-    if is_cli_backend_enabled():
-        command = build_agent_command(
-            model=OPENCODE_SPEC_MODEL,
-            prompt=prompt,
-            cwd=proj_dir,
-            files=[prompt_file],
-        )
-    else:
-        command = [
-            "opencode", "run",
-            "--model", f"{OPENCODE_MODEL_PROVIDER}/{OPENCODE_SPEC_MODEL}",
-            "--file", prompt_file,
-            "--", prompt,
-        ]
+    command = build_llm_cli_command(
+        model=OPENCODE_SPEC_MODEL,
+        prompt=prompt,
+        cwd=proj_dir,
+        files=[prompt_file],
+    )
     try:
         result = run_opencode_traced(
             proj_dir=proj_dir,
@@ -123,6 +160,7 @@ def _run_spec_generation_batch(
                 "fm_agent/workflow_spec_step4_batch.md",
                 batch_prompt_rel,
                 "fm_agent/spec_prompts/system_prompt.md",
+                *list_staged_domain_knowledge_relpaths(work_dir),
             ],
             output_files=function_files,
             summary=f"OpenCode spec generation for {batch_file}",
@@ -138,13 +176,21 @@ def _run_spec_generation_batch(
         return exc.returncode
 
 
-def run_pipeline(proj_dir, resume=False, required_source_files=None, extra_call_edges_path=None):
+def run_pipeline(
+    proj_dir,
+    resume=False,
+    required_source_files=None,
+    domain_knowledge_files=None,
+    submodules=None,
+    one_phase=False,
+    extra_call_edges_path=None,
+):
     if not os.path.isdir(proj_dir):
         print(f"[Pipeline] ERROR: proj_dir does not exist or is not a directory: {proj_dir}")
         sys.exit(1)
-
-    if not _has_source_code(proj_dir):
-        print(f"[Pipeline] ERROR: No source code files found in {proj_dir}. "
+    if not _has_source_code(proj_dir, submodules):
+        scope = f" selected submodule(s): {', '.join(submodules)}" if submodules else f" {proj_dir}"
+        print(f"[Pipeline] ERROR: No source code files found in{scope}. "
               f"Supported extensions: {', '.join(sorted(EXT_TO_LANG.keys()))}")
         sys.exit(1)
 
@@ -166,6 +212,14 @@ def run_pipeline(proj_dir, resume=False, required_source_files=None, extra_call_
     else:
         _clean_previous_run(work_dir)
     os.makedirs(work_dir, exist_ok=True)
+    domain_knowledge_relpaths = stage_domain_knowledge_files(
+        proj_dir, work_dir, domain_knowledge_files
+    )
+    if domain_knowledge_relpaths:
+        print(
+            "[Pipeline] User domain knowledge: "
+            f"{len(domain_knowledge_relpaths)} markdown file(s)."
+        )
 
     # Copy workflow_setup_extract.md to proj_dir and run opencode against it.
     # _run_setup_extract also force-lists any required_source_files the agent
@@ -174,6 +228,8 @@ def run_pipeline(proj_dir, resume=False, required_source_files=None, extra_call_
     _run_setup_extract(
         proj_dir, work_dir, script_dir, resume=resume,
         required_source_files=required_source_files,
+        submodules=submodules,
+        one_phase=one_phase,
     )
 
     # Build (or rebuild) the codegraph index if codegraph is installed. Both
@@ -206,8 +262,17 @@ def run_pipeline(proj_dir, resume=False, required_source_files=None, extra_call_
         os.path.join(spec_prompts_dir, "file_utils.py"),
     )
 
+    phases_path = os.path.join(work_dir, "phases.json")
+    with open(phases_path, "r") as f:
+        phases_data = json.load(f)
+
     print("[Pipeline] Stage 2/4: Collecting file list...")
-    file_list = collect_file_names(input_dir, os.path.join(work_dir, "fm_agent_file_list.json"))
+    file_list_path = os.path.join(work_dir, "fm_agent_file_list.json")
+    file_list = collect_file_names(input_dir, file_list_path)
+    if submodules:
+        file_list = _write_file_names(
+            _get_all_phase_files(phases_data, input_dir), file_list_path
+        )
 
     if not file_list:
         print("[Pipeline] No functions found to verify. Skipping spec generation.")
@@ -215,7 +280,6 @@ def run_pipeline(proj_dir, resume=False, required_source_files=None, extra_call_
 
     # --- Stage 3: Generate topdown layers ---
     print("[Pipeline] Stage 3/4: Generating topdown layers...")
-    phases_data = json.load(open(os.path.join(work_dir, "phases.json")))
     generate_topdown_layers(work_dir, extra_call_edges=extra_call_edges)
 
     # --- Stage 4: Execute spec generation workflow (per phase, per layer) ---
@@ -409,8 +473,9 @@ def run_pipeline(proj_dir, resume=False, required_source_files=None, extra_call_
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         usage="python3 main.py <proj_dir> [--resume] [--incremental INTENT_FILE] "
-              "[--isolate] [--entry-func PATH] [--end-func PATH ...] "
-              "[--extra-edge FILE]",
+              "[--domain-knowledge FILE ...] [--one-phase] [--isolate] "
+              "[--submodule PATH [PATH ...]] [--entry-func PATH] "
+              "[--end-func PATH ...] [--extra-edge FILE]",
         description="Run the FM agent pipeline on a project directory.",
     )
     parser.add_argument("proj_dir", help="path to the project directory")
@@ -432,6 +497,30 @@ if __name__ == "__main__":
         action="store_true",
         help="Run the pipeline against an isolated git worktree snapshot of "
         "the project instead of the project directory itself.",
+    )
+    parser.add_argument(
+        "--one-phase",
+        action="store_true",
+        help="Put all planned source files into a single analysis phase.",
+    )
+    parser.add_argument(
+        "--domain-knowledge",
+        "--knowledge",
+        metavar="FILE",
+        action="append",
+        nargs="+",
+        default=[],
+        help="additional Markdown domain-knowledge file(s) to copy into "
+        "fm_agent/spec_prompts/domain_context/user_knowledge/ and provide to "
+        "setup, spec generation, and validation agents. May be repeated. "
+        "FM_AGENT_DOMAIN_KNOWLEDGE can also provide os.pathsep-separated files.",
+    )
+    parser.add_argument(
+        "--submodule",
+        metavar="PATH",
+        nargs="+",
+        default=None,
+        help="Only process source code under one or more subdirectories of proj_dir.",
     )
     parser.add_argument(
         "--entry-func",
@@ -462,6 +551,28 @@ if __name__ == "__main__":
     extra_call_edges_path = args.extra_edge
     if extra_call_edges_path:
         extra_call_edges_path = os.path.abspath(extra_call_edges_path)
+    try:
+        submodules = _normalize_submodules(proj_dir, args.submodule)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    try:
+        domain_knowledge_files = collect_domain_knowledge_paths(
+            args.domain_knowledge,
+            base_dir=proj_dir,
+            fallback_base_dir=os.getcwd(),
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    if submodules and args.entry_func is not None:
+        parser.error("--submodule cannot be combined with --entry-func.")
+
+    # ---- pre-flight environment check (shared by all pipeline modes) ----
+    import config
+    from src.env_check import run as env_check_run
+    if not env_check_run(proj_dir, config):
+        sys.exit(0)
 
     start_time = time.time()
 
@@ -474,6 +585,8 @@ if __name__ == "__main__":
             entry_func=args.entry_func,
             end_funcs=args.end_func,
             resume=resume,
+            domain_knowledge_files=domain_knowledge_files,
+            one_phase=args.one_phase,
             extra_call_edges_path=extra_call_edges_path,
         )
         end_time = time.time()
@@ -529,12 +642,18 @@ if __name__ == "__main__":
                     run_dir,
                     intent_path,
                     old_commit,
+                    domain_knowledge_files=domain_knowledge_files,
+                    submodules=submodules,
+                    one_phase=args.one_phase,
                     extra_call_edges_path=extra_call_edges_path,
                 )
             else:
                 run_pipeline(
                     run_dir,
                     resume=resume,
+                    domain_knowledge_files=domain_knowledge_files,
+                    submodules=submodules,
+                    one_phase=args.one_phase,
                     extra_call_edges_path=extra_call_edges_path,
                 )
             # Record the commit that was processed. Written after the pipeline since
