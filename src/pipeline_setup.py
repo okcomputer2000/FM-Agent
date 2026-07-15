@@ -952,6 +952,9 @@ def _post_process_phases(proj_dir, work_dir, required_source_files=None,
     """Post-process phases.json: ensure required files, filter submodules,
     deduplicate, update descriptions, and clean empty phases before domain
     context generation.
+
+    Returns True if phases.json was modified in a way that requires domain
+    context regeneration (source files added/removed or phases renumbered).
     """
     phases_json = os.path.join(work_dir, "phases.json")
 
@@ -974,10 +977,23 @@ def _post_process_phases(proj_dir, work_dir, required_source_files=None,
     )
     _update_module_description(proj_dir, work_dir, changed_modules)
 
-    _clean_empty_phase_module(work_dir)
+    cleanup_result = _clean_empty_phase_module(work_dir)
 
     if one_phase:
         _collapse_phases_to_one(work_dir)
+
+    phases_modified = bool(
+        forced
+        or filter_changes.get("removed", 0)
+        or dedup_changes.get("modified_modules")
+        or cleanup_result.get("removed_phases")
+        or any(
+            old != new
+            for old, new in cleanup_result.get("renumbered", {}).items()
+        )
+        or one_phase
+    )
+    return phases_modified
 
 
 def _run_generate_domain_context(proj_dir, work_dir, script_dir, resume=False):
@@ -1066,8 +1082,8 @@ def _run_setup_extract(proj_dir, work_dir, script_dir, is_incremental=False,
     Backward-compatible wrapper that calls the three sub-stages in sequence.
     """
     _run_generate_phases(proj_dir, work_dir, script_dir, is_incremental, resume, submodules)
-    _post_process_phases(proj_dir, work_dir, required_source_files, submodules, one_phase=one_phase)
-    _run_generate_domain_context(proj_dir, work_dir, script_dir, resume)
+    phases_modified = _post_process_phases(proj_dir, work_dir, required_source_files, submodules, one_phase=one_phase)
+    _run_generate_domain_context(proj_dir, work_dir, script_dir, resume and not phases_modified)
 
     if not _setup_outputs_complete(work_dir):
         print(
