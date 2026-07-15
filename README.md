@@ -53,7 +53,7 @@ The [website](http://fm-agent.ai/) of FM-Agent provides an online service for re
 ### Requirements
 
 - Ubuntu (22.04 LTS, 24.04 LTS is tested)
-- Python 3.10
+- Python 3.12
 - pip >= 23
 - [openai](https://pypi.org/project/openai/) 2.15.0
 - [OpenCode](https://github.com/opencode-ai/opencode) 1.4.6
