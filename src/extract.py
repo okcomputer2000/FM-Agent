@@ -731,7 +731,9 @@ def run_extraction(proj_dir, work_dir=None, force=False, verbose=False):
     written = 0
     skipped = 0
     errors = []
+    manifest_units = {}
     for src_rel in source_files:
+        manifest_units.setdefault(src_rel, [])
         # Skip test files
         if _is_test_file(src_rel):
             if verbose:
