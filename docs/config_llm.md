@@ -22,6 +22,11 @@ effort   = ""                                 # override: LLM_EFFORT — optiona
 LLM_API_KEY=your-api-key                      # auth token for FM-Agent's direct calls
 ```
 
+> **Migrating from an older `.env`:** because `.env` outranks `fm-agent.toml`, any
+> non-secret setting still in your `.env` (e.g. `LLM_MODEL`) silently wins and
+> editing the toml has no effect. Move those lines out of `.env`, keeping only
+> `LLM_API_KEY`, so `fm-agent.toml` is the effective source.
+
 It calls the model two ways:
 
 - **OpenCode** (setup / spec / bug validation): `opencode run --model "$OPENCODE_MODEL_PROVIDER/$LLM_MODEL"`; FM-Agent supplies the matching OpenCode provider automatically (below), so no manual OpenCode config is needed.
