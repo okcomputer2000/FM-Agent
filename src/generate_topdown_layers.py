@@ -318,6 +318,7 @@ def _build_call_graph(
 
     phase_langs = {_detect_lang_from_ext(fp) for fp, _ in phase_files if _detect_lang_from_ext(fp)}
     registry_edges, registry_langs = call_edges_all(proj_dir, phase_langs)
+    chisel_edges = global_chisel_edges if global_chisel_edges is not None else registry_edges
 
     for filepath, module_name in phase_files:
         fqn = fqn_map[filepath]
@@ -325,7 +326,7 @@ def _build_call_graph(
         if not lang_key:
             continue
         if lang_key == "chisel":
-            for callee_fqn in global_chisel_edges.get(fqn, set()) if global_chisel_edges else ():
+            for callee_fqn in chisel_edges.get(fqn, set()):
                 if callee_fqn == fqn:
                     continue
                 all_callees_map[fqn].add(callee_fqn)
@@ -764,13 +765,6 @@ def generate_topdown_layers(proj_dir, phase_numbers=None, extra_call_edges=None)
                     entry["declared_name"] = chisel_declared_name(Path(filepath).read_text(encoding="utf-8", errors="replace"))
                     entry["is_module"] = True
                     entry["module_classification_reason"] = "module_unit"
-                    chisel_callees = sorted(global_chisel_edges.get(fqn, set()))
-                    entry[phase_callees_key] = sorted(set(chisel_callees) & phase_fqns)
-                    entry["all_callees"] = chisel_callees
-                    entry[phase_callers_key] = sorted(
-                        caller for caller, callees in global_chisel_edges.items()
-                        if fqn in callees and caller in phase_fqns
-                    )
                 info_names_by_caller = {
                     caller: sorted(info_names)
                     for caller, info_names in edge_aliases_map.get(fqn, {}).items()
