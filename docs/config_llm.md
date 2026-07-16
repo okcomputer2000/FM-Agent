@@ -80,11 +80,13 @@ built from:
 | a key under `models` | `name` / `LLM_MODEL` |
 
 To use another endpoint, change these in `fm-agent.toml` (or set the env
-overrides) — no OpenCode config edit needed. The injected config is *merged over*
-your global `opencode.json`, so its `plugin` array and other settings are
-preserved. It is only injected when `LLM_API_KEY` is set; if you authenticate
-OpenCode some other way, leave `LLM_API_KEY` unset and your own `opencode.json`
-provider is used unchanged.
+overrides) — no OpenCode config edit needed. FM-Agent's block is OpenCode's
+highest-precedence config source, so it **overrides** a same-named provider in
+your `opencode.json`; you don't need (and shouldn't keep) a hand-written provider
+block there. OpenCode deep-merges the rest per key, so your other providers and
+the `plugin` array are preserved. (The block is injected whenever `LLM_API_KEY`
+and the `[llm]` fields are set — which is the normal case, since the direct
+reasoner needs `LLM_API_KEY` too.)
 
 ## Third-party LLM services and cache routing
 

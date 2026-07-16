@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import tomllib
 from pathlib import Path
+from typing import Literal
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -91,7 +92,8 @@ class LLMCfg(_Section):
     # Endpoint API style, used to pick the OpenCode SDK adapter when FM-Agent
     # injects the provider block: "openai" -> @ai-sdk/openai-compatible (most
     # relays: OpenRouter, DeepSeek, …), "anthropic" -> @ai-sdk/anthropic.
-    api_style: str = "openai"
+    # Typed so a typo (or wrong case) fails fast at config load, not silently.
+    api_style: Literal["openai", "anthropic"] = "openai"
 
 
 class RuntimeCfg(_Section):
