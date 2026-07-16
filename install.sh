@@ -30,7 +30,15 @@ if [[ -f "$SCRIPT_DIR/.env" ]]; then
     set +a
 fi
 
-FM_AGENT_MODEL_BACKEND="${FM_AGENT_MODEL_BACKEND:-opencode}"
+# Backend default comes from fm-agent.toml [llm].backend (env > toml > opencode),
+# so the installer picks the same backend the runtime will. Falls back to opencode
+# if python3/tomllib isn't usable yet (a too-old python is rejected just below).
+if _toml_backend="$(python3 - "${FM_AGENT_CONFIG:-$SCRIPT_DIR/fm-agent.toml}" 2>/dev/null <<'PY'
+import sys, tomllib, pathlib
+print(tomllib.loads(pathlib.Path(sys.argv[1]).read_text()).get("llm", {}).get("backend", ""))
+PY
+)"; then :; else _toml_backend=""; fi
+FM_AGENT_MODEL_BACKEND="${FM_AGENT_MODEL_BACKEND:-${_toml_backend:-opencode}}"
 FM_AGENT_MODEL_BACKEND="$(echo "$FM_AGENT_MODEL_BACKEND" | tr '[:upper:]' '[:lower:]')"
 USE_LOCAL_CLI_BACKEND=0
 case "$FM_AGENT_MODEL_BACKEND" in
@@ -90,11 +98,11 @@ else
 fi
 
 # ---------- Python packages ----------
+# Always sync the full locked dependency set: config.py imports pydantic-settings
+# at startup, so a partial install (e.g. only `openai`) leaves `python main.py`
+# unable to import config.
 echo "[..] installing Python dependencies"
-if ! python3 -m pip install openai; then
-    echo "[..] pip install failed; syncing Python dependencies with uv"
-    uv sync --locked
-fi
+uv sync --locked
 
 # ---------- unzip ----------
 if command -v unzip &>/dev/null; then
@@ -146,27 +154,28 @@ else
 fi
 
 # ---------- codegraph (pinned via fm-agent.toml [codegraph]) ----------
-# The pinned fork build fixes a C extraction bug in upstream's latest release
-# (a macro attribute + typedef'd return type on a no-arg function is indexed under
-# its parameter list `(VOID)` instead of its name), so tracking upstream silently
-# drops functions. Repo + version come from fm-agent.toml so "which codegraph" is
-# set in one place; bump [codegraph].version there to switch. python3 (>=3.12,
-# checked above) has tomllib, and FM-Agent invokes codegraph by absolute path from
-# $codegraph_bin_dir, so that is the location that must hold the pin.
-_cg="$(python3 - "$SCRIPT_DIR/fm-agent.toml" <<'PY'
+# repo/version/bin_dir come from fm-agent.toml (bump [codegraph].version to switch);
+# the pinned fork build fixes an upstream C extraction bug that otherwise drops
+# macro-decorated functions. Read with python3's tomllib (needs 3.11+, ensured by
+# the 3.12 check above); FM_AGENT_CONFIG is honored like config.py so install and
+# runtime read the same file.
+_cg_toml="${FM_AGENT_CONFIG:-$SCRIPT_DIR/fm-agent.toml}"
+_cg="$(python3 - "$_cg_toml" <<'PY'
 import sys, os, tomllib, pathlib
 c = tomllib.loads(pathlib.Path(sys.argv[1]).read_text())["codegraph"]
 print(c["repo"]); print(c["version"]); print(os.path.expanduser(c["bin_dir"]))
 PY
 )"
-CODEGRAPH_REPO="$(printf '%s\n' "$_cg" | sed -n 1p)"
-CODEGRAPH_VERSION="$(printf '%s\n' "$_cg" | sed -n 2p)"
+_toml_repo="$(printf '%s\n' "$_cg" | sed -n 1p)"
+_toml_version="$(printf '%s\n' "$_cg" | sed -n 2p)"
 _toml_bin_dir="$(printf '%s\n' "$_cg" | sed -n 3p)"
-[ -n "$CODEGRAPH_REPO" ] && [ -n "$CODEGRAPH_VERSION" ] && [ -n "$_toml_bin_dir" ] || {
-    echo "[!!] could not read [codegraph] repo/version/bin_dir from fm-agent.toml"; exit 1; }
-codegraph_want="${CODEGRAPH_VERSION#v}"
-# env override wins over the toml default, matching config.py's env > toml.
+# env overrides the toml value, matching config.py's env > toml (for all three).
+CODEGRAPH_REPO="${CODEGRAPH_REPO:-$_toml_repo}"
+CODEGRAPH_VERSION="${CODEGRAPH_VERSION:-$_toml_version}"
 codegraph_bin_dir="${CODEGRAPH_BIN_DIR:-$_toml_bin_dir}"
+[ -n "$CODEGRAPH_REPO" ] && [ -n "$CODEGRAPH_VERSION" ] && [ -n "$codegraph_bin_dir" ] || {
+    echo "[!!] could not read [codegraph] repo/version/bin_dir from $_cg_toml"; exit 1; }
+codegraph_want="${CODEGRAPH_VERSION#v}"
 # Expand a leading ~ (the toml default is already absolute; a ~-containing env
 # value would otherwise diverge from codegraph.py's os.path.expanduser).
 case "$codegraph_bin_dir" in "~"|"~/"*) codegraph_bin_dir="$HOME${codegraph_bin_dir#\~}";; esac

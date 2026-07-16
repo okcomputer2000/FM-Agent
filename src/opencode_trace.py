@@ -114,6 +114,18 @@ def _opencode_provider_config():
     }
 
 
+def _deep_merge(base: dict, overlay: dict) -> dict:
+    """Recursively merge ``overlay`` into ``base``; ``overlay`` wins on conflicting
+    leaves, nested dicts are merged (mirrors OpenCode's own config merge)."""
+    out = dict(base)
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
 def _opencode_env(work_dir, event_id):
     env = os.environ.copy()
     trace_dir = os.path.abspath(os.path.join(_trace_dir(work_dir), "opencode"))
@@ -123,10 +135,22 @@ def _opencode_env(work_dir, event_id):
     provider_config = _opencode_provider_config()
     if provider_config is not None:
         # Make the resolved key available under LLM_API_KEY so the injected
-        # `{env:LLM_API_KEY}` resolves regardless of where config read it from,
-        # then hand OpenCode the provider block as the highest-precedence source.
+        # `{env:LLM_API_KEY}` resolves regardless of where config read it from.
         env["LLM_API_KEY"] = settings.llm.api_key
-        env["OPENCODE_CONFIG_CONTENT"] = json.dumps(provider_config)
+        # Merge our provider block into any OPENCODE_CONFIG_CONTENT the caller
+        # already set (rather than overwriting it), so their inline plugins /
+        # permissions / MCP / agents survive; our provider still wins on the
+        # provider key it defines.
+        existing = {}
+        raw = env.get("OPENCODE_CONFIG_CONTENT")
+        if raw:
+            try:
+                loaded = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                loaded = None
+            if isinstance(loaded, dict):
+                existing = loaded
+        env["OPENCODE_CONFIG_CONTENT"] = json.dumps(_deep_merge(existing, provider_config))
     # subprocess.Popen(cwd=...) chdirs the child but doesn't sync PWD; opencode
     # walks PWD upward looking for AGENTS.md, so without this it picks up the
     # fm-agent repo's own AGENTS.md instead of the target's, baking ~10K bytes

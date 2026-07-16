@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Literal
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -35,9 +35,18 @@ from pydantic_settings import (
 # Populate os.environ from .env without clobbering real env vars (so env > .env).
 load_dotenv()
 
-_CONFIG_PATH = Path(
-    os.environ.get("FM_AGENT_CONFIG") or Path(__file__).parent / "fm-agent.toml"
+_explicit_config = os.environ.get("FM_AGENT_CONFIG")
+_CONFIG_PATH = (
+    Path(_explicit_config)
+    if _explicit_config
+    else Path(__file__).parent / "fm-agent.toml"
 )
+# A typo'd FM_AGENT_CONFIG should fail fast, not silently fall back to defaults
+# (a missing default fm-agent.toml is tolerated — the built-in defaults apply).
+if _explicit_config and not _CONFIG_PATH.is_file():
+    raise SystemExit(
+        f"FM-Agent: FM_AGENT_CONFIG points at a file that does not exist: {_CONFIG_PATH}"
+    )
 
 # Legacy environment variable -> (toml section, field). This table is the single
 # place mapping an env var to a setting; it doubles as documentation of every
@@ -98,15 +107,20 @@ class LLMCfg(_Section):
 
 
 class RuntimeCfg(_Section):
-    max_spec_iter: int = 5
-    granularity: int = 40
-    max_workers: int = 10
-    opencode_max_retries: int = 5
-    bug_validation_max_retries: int = 1
+    # These must be positive — e.g. granularity=0 makes the reasoner's block
+    # splitter loop forever, max_workers=0 crashes the thread pool, and a
+    # non-positive timeout expires immediately. Validated so a bad value fails
+    # fast at startup rather than hanging or crashing mid-run.
+    max_spec_iter: int = Field(default=5, gt=0)
+    granularity: int = Field(default=40, gt=0)
+    max_workers: int = Field(default=10, gt=0)
+    opencode_max_retries: int = Field(default=5, gt=0)
+    # Retries in addition to the initial attempt, so 0 (no retries) is valid.
+    bug_validation_max_retries: int = Field(default=1, ge=0)
     # Hard cap on ONE `opencode run` subprocess. A model connection that dies
     # silently (e.g. through a forward proxy) otherwise hangs the pipeline
     # forever — opencode has no model-call timeout of its own.
-    opencode_timeout_s: int = 1800
+    opencode_timeout_s: int = Field(default=1800, gt=0)
     # Extra domain-knowledge markdown paths (os.pathsep- or newline-separated);
     # env-driven, so no committed default.
     domain_knowledge_paths: str = ""
@@ -114,18 +128,18 @@ class RuntimeCfg(_Section):
 
 class ScopeCfg(_Section):
     # Max functions retained per source file in the final scoped output.
-    top_k: int = 5
+    top_k: int = Field(default=5, gt=0)
     # Run LLM re-ranking when a file has at least this many dedup'd functions.
-    llm_trigger_funcs: int = 5
+    llm_trigger_funcs: int = Field(default=5, gt=0)
     # Candidate functions requested from the LLM during re-ranking.
-    llm_top_k: int = 5
+    llm_top_k: int = Field(default=5, gt=0)
     # Run LLM re-ranking when the heuristic top score is below this threshold.
-    llm_confidence_threshold: float = 8.0
+    llm_confidence_threshold: float = Field(default=8.0, ge=0)
 
 
 class ErlangCfg(_Section):
     command: str = "elp"
-    timeout_s: int = 180
+    timeout_s: int = Field(default=180, gt=0)
 
 
 class InjectCfg(_Section):
