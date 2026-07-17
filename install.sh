@@ -162,8 +162,10 @@ fi
 _cg_toml="${FM_AGENT_CONFIG:-$SCRIPT_DIR/fm-agent.toml}"
 _cg="$(python3 - "$_cg_toml" <<'PY'
 import sys, os, tomllib, pathlib
-c = tomllib.loads(pathlib.Path(sys.argv[1]).read_text())["codegraph"]
-print(c["repo"]); print(c["version"]); print(os.path.expanduser(c["bin_dir"]))
+c = tomllib.loads(pathlib.Path(sys.argv[1]).read_text()).get("codegraph", {})
+bin_dir = c.get("bin_dir", "")
+print(c.get("repo", "")); print(c.get("version", ""))
+print(os.path.expanduser(bin_dir) if bin_dir else "")
 PY
 )"
 _toml_repo="$(printf '%s\n' "$_cg" | sed -n 1p)"
