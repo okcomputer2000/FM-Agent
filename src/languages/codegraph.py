@@ -131,7 +131,7 @@ def _bare_function_name(name: str) -> str:
 
         symbol = []
         for ch in rest:
-            if ch in "+-*/%&|^~!=<>":
+            if ch in "+-*/%&|^~!=<>,":
                 symbol.append(ch)
             else:
                 break
