@@ -100,6 +100,7 @@ def _bare_function_name(name: str) -> str:
     - Simple identifier: ``"my_func"`` -> ``"my_func"``
     - Qualified name: ``"ns::Cls::method"`` -> ``"method"``
     - Go pointer receiver: ``"(*T).Method"`` -> ``"Method"``
+    - C++ operator overload: ``"Vec::operator=="`` -> ``"operator=="``
     - Function-pointer: ``"(*func)(type *param)"`` -> ``"func"``
     - Pointer return: ``"*func_name(...)"`` -> ``"func_name"``
     - this-dot: ``"this.onClick"`` -> ``"onClick"``
@@ -109,7 +110,33 @@ def _bare_function_name(name: str) -> str:
     if not name:
         return ""
 
-    m = re.search(r'(?:[:\.)])(\w+)$', name)
+    tail = name
+    if "::" in tail:
+        tail = tail.rsplit("::", 1)[1].lstrip()
+    elif "." in tail:
+        tail = tail.rsplit(".", 1)[1].lstrip()
+
+    if tail.startswith("operator"):
+        rest = tail[len("operator"):].lstrip()
+        if rest.startswith("[]"):
+            return "operator[]"
+        if rest.startswith("()"):
+            return "operator()"
+        if re.fullmatch(r'new(?:\s*\[\s*\])?', rest):
+            return "operator new[]" if "[" in rest else "operator new"
+        if re.fullmatch(r'delete(?:\s*\[\s*\])?', rest):
+            return "operator delete[]" if "[" in rest else "operator delete"
+
+        symbol = []
+        for ch in rest:
+            if ch in "+-*/%&|^~!=<>,":
+                symbol.append(ch)
+            else:
+                break
+        if symbol:
+            return "operator" + "".join(symbol)
+
+    m = re.search(r'(?:^|::|\.)(\w+)$', name)
     if m:
         return m.group(1)
     m = re.match(r'\(\s*\*\s*(\w+)\s*\)', name)
