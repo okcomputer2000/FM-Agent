@@ -96,7 +96,7 @@ cp .env.example .env
 LLM_API_KEY=your-api-key-here
 ```
 
-Non-secret settings — model, endpoint, backend, provider, etc. — live in `fm-agent.toml` under `[llm]`. Edit them there, or override any one with its environment variable (e.g. `LLM_MODEL=...`), which takes precedence over the toml. Do not re-add these to `.env`: a value left there silently overrides the toml. See [docs/config_llm.md](docs/config_llm.md) for details and OpenCode provider setup.
+Non-secret settings — model, endpoint, backend, provider, etc. — live in `fm-agent.toml` under `[llm]`. Edit them there for a permanent change. To override without touching the committed file — e.g. on a git clone you update with `git pull` — set the matching environment variable in `.env` or your shell. Precedence is `env > .env > fm-agent.toml`; because `.env` wins over the toml, a stale value there overrides a later toml edit, so check `.env` first if a change isn't taking effect. See [docs/config_llm.md](docs/config_llm.md) for details and OpenCode provider setup.
 
 Then, all of the above dependencies (except Ubuntu and Python) can be installed via the provided script:
 

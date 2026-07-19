@@ -95,7 +95,7 @@ cp .env.example .env
 LLM_API_KEY=your-api-key-here
 ```
 
-非密钥配置——模型、endpoint、backend、provider 等——在 `fm-agent.toml` 的 `[llm]` 段。直接在那里改,或用对应的环境变量覆盖某一项（如 `LLM_MODEL=...`,优先级高于 toml）。不要把这些重新写回 `.env`：`.env` 里残留的值会静默覆盖 toml。详情及 OpenCode provider 配置见 [docs/config_llm.md](docs/config_llm.md)。
+非密钥配置——模型、endpoint、backend、provider 等——在 `fm-agent.toml` 的 `[llm]` 段,直接改它是永久生效的做法。若不想动这个被 git 跟踪的文件（比如你是 git clone、之后会 `git pull` 更新），可以用对应的环境变量覆盖,写在 `.env` 或 shell 里即可。优先级为 `env > .env > fm-agent.toml`；由于 `.env` 会盖过 toml,残留的旧值会覆盖你后来对 toml 的修改——所以改了 toml 不生效时,先检查 `.env`。详情及 OpenCode provider 配置见 [docs/config_llm.md](docs/config_llm.md)。
 
 上述所有依赖（Ubuntu 和 Python 除外）均可通过以下脚本一键安装：
 
