@@ -10,6 +10,7 @@ from src.configure_llm import (
     ConfigWizardError,
     LLMConfigInput,
     WizardPaths,
+    adapter_for_api_style,
     apply_configuration,
     merge_opencode_config,
     parse_existing_opencode_config,
@@ -95,6 +96,25 @@ class ConfigureLLMTests(unittest.TestCase):
         self.assertIn("existing-model", merged["provider"]["openrouter"]["models"])
         self.assertIn(self.config.model_id, merged["provider"]["openrouter"]["models"])
 
+    def test_anthropic_endpoint_uses_anthropic_adapter(self):
+        config = LLMConfigInput(
+            provider_id="anthropic-direct",
+            provider_name="Anthropic",
+            api_style="anthropic",
+            base_url="https://api.anthropic.com/v1",
+            model_id="claude-sonnet-4-6",
+            api_key="sk-ant-test",
+        )
+        merged = merge_opencode_config({}, config)
+        self.assertEqual(
+            merged["provider"]["anthropic-direct"]["npm"],
+            adapter_for_api_style("anthropic"),
+        )
+        self.assertIn(
+            "claude-sonnet-4-6",
+            merged["provider"]["anthropic-direct"]["models"],
+        )
+
     def test_invalid_existing_opencode_json_is_rejected(self):
         with self.assertRaises(ConfigWizardError):
             parse_existing_opencode_config("{not-json}")
@@ -102,6 +122,22 @@ class ConfigureLLMTests(unittest.TestCase):
     def test_invalid_existing_toml_is_rejected(self):
         with self.assertRaises(ConfigWizardError):
             update_fm_agent_toml_text("[llm\nname='x'\n", self.config)
+
+    def test_invalid_base_url_is_rejected(self):
+        bad = LLMConfigInput(
+            provider_id="openrouter",
+            provider_name="OpenRouter",
+            api_style="openai",
+            base_url="not-a-url",
+            model_id="anthropic/claude-sonnet-4.6",
+            api_key="sk-test-1234",
+        )
+        with self.assertRaises(ConfigWizardError):
+            apply_configuration(
+                bad,
+                WizardPaths(Path("/tmp"), Path("/tmp/.env"), Path("/tmp/fm-agent.toml"), Path("/tmp/opencode.json")),
+                validate=True,
+            )
 
     def test_apply_configuration_writes_all_files(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -171,6 +207,48 @@ class ConfigureLLMTests(unittest.TestCase):
             self.assertIn("[llm]\n", updated_toml)
             opencode = json.loads(opencode_path.read_text(encoding="utf-8"))
             self.assertIn("openrouter", opencode["provider"])
+
+    def test_apply_configuration_is_idempotent_for_same_provider_and_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            toml_path = root / "fm-agent.toml"
+            env_path = root / ".env"
+            opencode_path = root / "opencode" / "opencode.json"
+            toml_path.write_text(
+                textwrap.dedent(
+                    """\
+                    [llm]
+                    name = "old-model"
+                    provider = "old"
+                    base_url = "https://old.example/v1"
+                    backend = "auto"
+                    api_style = "anthropic"
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            apply_configuration(
+                self.config,
+                WizardPaths(root, env_path, toml_path, opencode_path),
+                validate=True,
+            )
+            first = opencode_path.read_text(encoding="utf-8")
+
+            apply_configuration(
+                self.config,
+                WizardPaths(root, env_path, toml_path, opencode_path),
+                validate=True,
+            )
+            second = opencode_path.read_text(encoding="utf-8")
+
+            self.assertEqual(json.loads(first), json.loads(second))
+            opencode = json.loads(second)
+            self.assertEqual(list(opencode["provider"].keys()), ["openrouter"])
+            self.assertEqual(
+                list(opencode["provider"]["openrouter"]["models"].keys()),
+                ["anthropic/claude-sonnet-4.6"],
+            )
 
 
 if __name__ == "__main__":

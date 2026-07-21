@@ -449,6 +449,18 @@ def _prompt(prompt: str, default: str | None = None) -> str:
     return raw or (default or "")
 
 
+def _prompt_yes_no(prompt: str, default: bool = True) -> bool:
+    hint = "Y/n" if default else "y/N"
+    choice = _prompt(f"{prompt} [{hint}]").lower()
+    if not choice:
+        return default
+    if choice in ("y", "yes"):
+        return True
+    if choice in ("n", "no"):
+        return False
+    raise ConfigWizardError("Please answer yes or no.")
+
+
 def prompt_for_config() -> tuple[LLMConfigInput, bool]:
     print("FM-Agent LLM configuration")
     print()
@@ -467,12 +479,15 @@ def prompt_for_config() -> tuple[LLMConfigInput, bool]:
     else:
         raise ConfigWizardError("Protocol selection must be 1 or 2.")
 
-    default_base = "https://openrouter.ai/api/v1" if api_style == "openai" else "https://api.anthropic.com/v1"
+    default_base = (
+        "https://openrouter.ai/api/v1"
+        if api_style == "openai"
+        else "https://api.anthropic.com/v1"
+    )
     base_url = _prompt("API base URL", default_base)
     model_id = _prompt("Model ID")
     api_key = getpass("API key: ").strip()
-    validate_choice = _prompt("Validate generated configuration? [Y/n]", "Y").lower()
-    validate = validate_choice in ("", "y", "yes")
+    validate = _prompt_yes_no("Validate generated configuration?", default=True)
     config = LLMConfigInput(
         provider_id=provider_id,
         provider_name=provider_name,
@@ -490,8 +505,7 @@ def run_wizard(project_root: Path) -> int:
     print()
     print(_preview(config, paths))
     print()
-    confirm = _prompt("Continue? [Y/n]", "Y").lower()
-    if confirm not in ("", "y", "yes"):
+    if not _prompt_yes_no("Continue?", default=True):
         print("Aborted.")
         return 1
 
