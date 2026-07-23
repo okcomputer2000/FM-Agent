@@ -138,6 +138,8 @@ you do not need to hand-edit `~/.config/opencode/opencode.json` for the model
 or key. The configuration wizard above can still keep that file synchronized for
 standalone OpenCode usage by writing the API key to a private provider-specific
 key file in the OpenCode config directory (see [docs/config_llm.md](docs/config_llm.md)).
+If you already use `OPENCODE_CONFIG`, the wizard updates that file instead of
+the default global path.
 
 **Important:** FM-Agent automatically derives test cases based on the reasoning process to trigger potential bugs, which help developers locate and fix them. Before running FM-Agent, please ensure the execution environment for test cases is ready, and if necessary, specify how to run test cases in `md/bug_validator.md`. If you do not specify, the agent will autonomously decide the execution method.
 

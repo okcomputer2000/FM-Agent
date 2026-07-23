@@ -35,6 +35,8 @@ The wizard never prints the API key in plain text. It writes the key to
 `.env` for FM-Agent and to a private provider-specific key file in the OpenCode
 config directory for standalone OpenCode; the generated provider references that
 file via `{file:/absolute/path/to/key}`.
+If `OPENCODE_CONFIG` is set, the wizard uses that config file path instead of
+the default global location.
 
 `fm-agent.toml` (committed, non-secret):
 

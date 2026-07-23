@@ -93,6 +93,9 @@ def validate_input(config: LLMConfigInput) -> None:
 
 
 def detect_opencode_config_path(home: Path | None = None) -> Path:
+    custom_config = os.environ.get("OPENCODE_CONFIG")
+    if custom_config:
+        return Path(custom_config).expanduser()
     home = home or Path.home()
     if os.name == "nt":
         appdata = os.environ.get("APPDATA")
