@@ -61,7 +61,6 @@ class WizardPaths:
     env_path: Path
     toml_path: Path
     opencode_config_path: Path
-    opencode_secret_path: Path
 
 
 def adapter_for_api_style(api_style: ApiStyle) -> str:
@@ -115,13 +114,11 @@ def detect_opencode_config_path(home: Path | None = None) -> Path:
 
 
 def default_paths(project_root: Path) -> WizardPaths:
-    opencode_config_path = detect_opencode_config_path()
     return WizardPaths(
         project_root=project_root,
         env_path=project_root / ".env",
         toml_path=project_root / "fm-agent.toml",
-        opencode_config_path=opencode_config_path,
-        opencode_secret_path=opencode_config_path.with_name("fm-agent-opencode-api-key"),
+        opencode_config_path=detect_opencode_config_path(),
     )
 
 
@@ -503,12 +500,22 @@ def _private_backup_root() -> Path:
     return Path(tempfile.gettempdir()) / f"fm-agent-config-backups-{safe}"
 
 
-def secret_path_for_provider(config: LLMConfigInput, opencode_config_path: Path) -> Path:
+def _private_opencode_secret_dir() -> Path:
+    if os.name == "nt":
+        appdata = os.environ.get("APPDATA")
+        base_dir = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
+    else:
+        xdg_state = os.environ.get("XDG_STATE_HOME")
+        base_dir = Path(xdg_state) if xdg_state else Path.home() / ".local" / "state"
+    return base_dir / "fm-agent" / "opencode"
+
+
+def secret_path_for_provider(config: LLMConfigInput) -> Path:
     safe_provider_id = re.sub(r"[^A-Za-z0-9._-]+", "_", config.provider_id).strip("._-")
     if not safe_provider_id:
         safe_provider_id = "provider"
     digest = hashlib.sha256(config.provider_id.encode("utf-8")).hexdigest()[:10]
-    return opencode_config_path.with_name(
+    return _private_opencode_secret_dir() / (
         f"fm-agent-opencode-api-key.{safe_provider_id}.{digest}"
     )
 
@@ -536,7 +543,7 @@ def _read_text_if_exists(path: Path) -> str:
 
 
 def _preview(config: LLMConfigInput, paths: WizardPaths) -> str:
-    secret_path = secret_path_for_provider(config, paths.opencode_config_path)
+    secret_path = secret_path_for_provider(config)
     return "\n".join(
         [
             "FM-Agent LLM configuration",
@@ -572,7 +579,7 @@ def apply_configuration(
             f"fm-agent.toml not found at {paths.toml_path}; refusing to guess a new project config."
         )
     opencode_text = _read_text_if_exists(paths.opencode_config_path)
-    opencode_secret_path = secret_path_for_provider(config, paths.opencode_config_path)
+    opencode_secret_path = secret_path_for_provider(config)
 
     updated_env = update_env_text(env_text, config.api_key)
     updated_toml = update_fm_agent_toml_text(toml_text, config)
@@ -597,6 +604,8 @@ def apply_configuration(
     ]
     atomic_write(paths.toml_path, updated_toml)
     atomic_write(paths.env_path, updated_env)
+    opencode_secret_path.parent.mkdir(parents=True, exist_ok=True)
+    opencode_secret_path.parent.chmod(0o700)
     atomic_write(opencode_secret_path, config.api_key + "\n")
     opencode_secret_path.chmod(0o600)
     atomic_write(
