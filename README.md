@@ -91,7 +91,7 @@ uv run python src/configure_llm.py
 ```
 
 It previews the changes, backs up existing files, updates `fm-agent.toml`, stores
-the API key only in `.env`, and syncs the matching OpenCode provider entry in
+the API key in `.env` plus a private local key file for standalone OpenCode, and syncs the matching OpenCode provider entry in
 `~/.config/opencode/opencode.json` (or the platform-equivalent config path)
 without requiring you to hand-edit JSON.
 
@@ -137,7 +137,7 @@ FM-Agent configures OpenCode's provider automatically from `fm-agent.toml`, so
 you do not need to hand-edit `~/.config/opencode/opencode.json` for the model
 or key. The configuration wizard above can still keep that file synchronized for
 standalone OpenCode usage by writing the API key to a private provider-specific
-key file in the OpenCode config directory (see [docs/config_llm.md](docs/config_llm.md)).
+key file under your user state/config directory (see [docs/config_llm.md](docs/config_llm.md)).
 If you already use `OPENCODE_CONFIG`, the wizard updates that file instead of
 the default global path.
 

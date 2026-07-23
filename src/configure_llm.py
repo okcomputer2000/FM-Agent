@@ -191,13 +191,19 @@ def _strip_jsonc(text: str) -> str:
             continue
         if ch == "/" and nxt == "*":
             i += 2
+            terminated = False
             while i < len(text) - 1:
                 if text[i] == "*" and text[i + 1] == "/":
                     i += 2
+                    terminated = True
                     break
                 if text[i] in "\r\n":
                     out.append(text[i])
                 i += 1
+            if not terminated:
+                raise ConfigWizardError(
+                    "Existing OpenCode config has an unterminated JSONC block comment."
+                )
             continue
 
         out.append(ch)
@@ -309,6 +315,7 @@ def merge_opencode_config(
 
 _SECTION_RE = re.compile(r"^\s*\[([A-Za-z0-9_.-]+)\]\s*(?:#.*)?$")
 _KV_RE = re.compile(r"^(\s*)([A-Za-z0-9_]+)(\s*=\s*)(.*?)(\s*(#.*)?)$")
+_ENV_EXPORT_PREFIX_RE = re.compile(r"^export[^\S\r\n]+")
 
 
 def _quote_toml_string(value: str) -> str:
@@ -396,9 +403,10 @@ def update_env_text(text: str, api_key: str) -> str:
         export_prefix = ""
         working = line
         leading = line[: len(line) - len(stripped)]
-        if stripped.startswith("export "):
-            export_prefix = leading + "export "
-            working = leading + stripped[len("export ") :]
+        export_match = _ENV_EXPORT_PREFIX_RE.match(stripped)
+        if export_match:
+            export_prefix = leading + export_match.group()
+            working = leading + stripped[export_match.end() :]
 
         key, sep, _value = working.partition("=")
         if not sep:
@@ -482,7 +490,7 @@ def backup_file(
         backup_dir.mkdir(parents=True, exist_ok=True)
         backup_dir.chmod(0o700)
         path_slug = str(path.parent.resolve()).strip(os.sep).replace(os.sep, "_") or "project"
-        backup = backup_dir / f"{path_slug}__env.bak.{suffix}"
+        backup = backup_dir / f"{path_slug}__{path.name}.bak.{suffix}"
     else:
         backup = path.with_name(f"{path.name}.bak.{suffix}")
     shutil.copy2(path, backup)
@@ -506,7 +514,12 @@ def _private_opencode_secret_dir() -> Path:
         base_dir = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
     else:
         xdg_state = os.environ.get("XDG_STATE_HOME")
-        base_dir = Path(xdg_state) if xdg_state else Path.home() / ".local" / "state"
+        xdg_state_path = Path(xdg_state).expanduser() if xdg_state else None
+        base_dir = (
+            xdg_state_path
+            if xdg_state_path and xdg_state_path.is_absolute()
+            else Path.home() / ".local" / "state"
+        )
     return base_dir / "fm-agent" / "opencode"
 
 
@@ -599,7 +612,10 @@ def apply_configuration(
     backups = [
         (paths.toml_path, backup_file(paths.toml_path)),
         (paths.env_path, backup_file(paths.env_path, private=True)),
-        (paths.opencode_config_path, backup_file(paths.opencode_config_path)),
+        (
+            paths.opencode_config_path,
+            backup_file(paths.opencode_config_path, private=True),
+        ),
         (opencode_secret_path, backup_file(opencode_secret_path, private=True)),
     ]
     atomic_write(paths.toml_path, updated_toml)

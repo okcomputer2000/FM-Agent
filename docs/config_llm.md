@@ -31,6 +31,10 @@ It then:
 - merges the matching provider entry into the detected OpenCode config file
 - previews the target files, requests confirmation, backs up existing files, and writes atomically
 
+Backups of `.env`, prior OpenCode key files, and OpenCode configuration files
+are placed in a user-private backup directory, since an existing OpenCode
+configuration can contain a literal API key.
+
 The wizard never prints the API key in plain text. It writes the key to
 `.env` for FM-Agent and to a private provider-specific key file under the
 user's own state/config directory for standalone OpenCode; the generated
