@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -480,7 +481,7 @@ def backup_file(
     now = now or datetime.now()
     suffix = now.strftime("%Y%m%d-%H%M%S")
     if private:
-        backup_dir = Path(tempfile.gettempdir()) / "fm-agent-config-backups"
+        backup_dir = _private_backup_root()
         backup_dir.mkdir(parents=True, exist_ok=True)
         backup_dir.chmod(0o700)
         path_slug = str(path.parent.resolve()).strip(os.sep).replace(os.sep, "_") or "project"
@@ -493,11 +494,23 @@ def backup_file(
     return backup
 
 
+def _private_backup_root() -> Path:
+    if hasattr(os, "getuid"):
+        user_component = f"uid-{os.getuid()}"
+    else:
+        user_component = os.environ.get("USERNAME") or os.environ.get("USER") or "user"
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", user_component).strip("._-") or "user"
+    return Path(tempfile.gettempdir()) / f"fm-agent-config-backups-{safe}"
+
+
 def secret_path_for_provider(config: LLMConfigInput, opencode_config_path: Path) -> Path:
     safe_provider_id = re.sub(r"[^A-Za-z0-9._-]+", "_", config.provider_id).strip("._-")
     if not safe_provider_id:
         safe_provider_id = "provider"
-    return opencode_config_path.with_name(f"fm-agent-opencode-api-key.{safe_provider_id}")
+    digest = hashlib.sha256(config.provider_id.encode("utf-8")).hexdigest()[:10]
+    return opencode_config_path.with_name(
+        f"fm-agent-opencode-api-key.{safe_provider_id}.{digest}"
+    )
 
 
 def atomic_write(path: Path, text: str) -> None:
