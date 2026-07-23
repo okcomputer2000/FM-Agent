@@ -86,7 +86,7 @@ FM-Agent 的[官方网站](http://fm-agent.ai/)提供了在线代码库推理服
 把 API 密钥放进 `.env`（已 gitignore，FM-Agent 通过 python-dotenv 自动加载）；其余所有配置在 `fm-agent.toml` 里都有 committed 的默认值。最简单的配置方式是运行交互式向导：
 
 ```bash
-python3 scripts/configure_llm.py
+uv run python src/configure_llm.py
 ```
 
 该向导会先展示预览、备份已有文件，然后更新 `fm-agent.toml`、只把 API 密钥写入 `.env`，并同步对应的 OpenCode provider 到 `~/.config/opencode/opencode.json`（或当前平台上的等价路径），无需手写 JSON。

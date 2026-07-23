@@ -526,3 +526,18 @@ def run_wizard(project_root: Path) -> int:
     if validate:
         print("✓ Configuration syntax is valid")
     return 0
+
+
+def main() -> int:
+    try:
+        return run_wizard(Path(__file__).resolve().parents[1])
+    except KeyboardInterrupt:
+        print("\nAborted.")
+        return 1
+    except ConfigWizardError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

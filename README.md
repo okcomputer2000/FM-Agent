@@ -87,7 +87,7 @@ Set the LLM API key used by both FM-Agent and OpenCode. We recommend [OpenRouter
 The easiest setup path is the interactive wizard:
 
 ```bash
-python3 scripts/configure_llm.py
+uv run python src/configure_llm.py
 ```
 
 It previews the changes, backs up existing files, updates `fm-agent.toml`, stores

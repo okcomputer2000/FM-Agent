@@ -10,7 +10,7 @@ the toml — so an existing `.env` that sets these still works.
 Run:
 
 ```bash
-python3 scripts/configure_llm.py
+uv run python src/configure_llm.py
 ```
 
 The wizard prompts for:
