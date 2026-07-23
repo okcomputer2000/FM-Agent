@@ -140,16 +140,101 @@ def parse_existing_opencode_config(text: str) -> dict:
     if not text.strip():
         return {}
     try:
-        loaded = json.loads(text)
+        loaded = json.loads(_strip_jsonc(text))
     except json.JSONDecodeError as exc:
         raise ConfigWizardError(
-            "Existing OpenCode config is invalid JSON; refusing to overwrite it."
+            "Existing OpenCode config is invalid JSON/JSONC; refusing to overwrite it."
         ) from exc
     if not isinstance(loaded, dict):
         raise ConfigWizardError(
             "Existing OpenCode config must be a JSON object at the top level."
         )
     return loaded
+
+
+def _strip_jsonc(text: str) -> str:
+    out: list[str] = []
+    in_string = False
+    escape = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+        if in_string:
+            out.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            i += 1
+            continue
+
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == "/" and nxt == "/":
+            i += 2
+            while i < len(text) and text[i] not in "\r\n":
+                i += 1
+            continue
+        if ch == "/" and nxt == "*":
+            i += 2
+            while i < len(text) - 1:
+                if text[i] == "*" and text[i + 1] == "/":
+                    i += 2
+                    break
+                if text[i] in "\r\n":
+                    out.append(text[i])
+                i += 1
+            continue
+
+        out.append(ch)
+        i += 1
+
+    return _remove_trailing_commas("".join(out))
+
+
+def _remove_trailing_commas(text: str) -> str:
+    out: list[str] = []
+    in_string = False
+    escape = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if in_string:
+            out.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            i += 1
+            continue
+
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == ",":
+            j = i + 1
+            while j < len(text) and text[j] in " \t\r\n":
+                j += 1
+            if j < len(text) and text[j] in "}]":
+                i += 1
+                continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
 
 
 def merge_opencode_config(existing: dict, config: LLMConfigInput) -> dict:
@@ -296,13 +381,20 @@ def update_env_text(text: str, api_key: str) -> str:
             new_lines.append(line)
             continue
 
-        key, sep, _value = line.partition("=")
+        export_prefix = ""
+        working = line
+        leading = line[: len(line) - len(stripped)]
+        if stripped.startswith("export "):
+            export_prefix = leading + "export "
+            working = leading + stripped[len("export ") :]
+
+        key, sep, _value = working.partition("=")
         if not sep:
             new_lines.append(line)
             continue
         env_key = key.strip()
         if env_key == ENV_SECRET_KEY:
-            new_lines.append(f"{ENV_SECRET_KEY}={api_key}\n")
+            new_lines.append(f"{export_prefix}{ENV_SECRET_KEY}={api_key}\n")
             key_written = True
             continue
         if env_key in ENV_LEGACY_LLM_KEYS:
@@ -361,11 +453,14 @@ def backup_file(path: Path, now: datetime | None = None) -> Path | None:
     if path.name == ".env":
         backup_dir = Path(tempfile.gettempdir()) / "fm-agent-config-backups"
         backup_dir.mkdir(parents=True, exist_ok=True)
+        backup_dir.chmod(0o700)
         path_slug = str(path.parent.resolve()).strip(os.sep).replace(os.sep, "_") or "project"
         backup = backup_dir / f"{path_slug}__env.bak.{suffix}"
     else:
         backup = path.with_name(f"{path.name}.bak.{suffix}")
     shutil.copy2(path, backup)
+    if path.name == ".env":
+        backup.chmod(0o600)
     return backup
 
 
