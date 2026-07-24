@@ -26,23 +26,29 @@ The wizard prompts for:
 
 It then:
 
-- updates `fm-agent.toml` with the non-secret `[llm]` settings
+- updates the active FM-Agent TOML file with the non-secret `[llm]` settings
 - updates `.env` with `LLM_API_KEY` only
-- removes the common legacy LLM override keys from `.env` so they no longer shadow the toml
+- removes all non-secret legacy LLM override keys from `.env` (including `export KEY=value` lines) so they no longer shadow the toml
 - merges the matching provider entry into the detected OpenCode config file
 - previews the target files, requests confirmation, backs up existing files, and writes atomically
 
-When you select `auto`, `codex-cli`, or `claude-cli`, the wizard only updates
-`backend` in `fm-agent.toml`. These local CLI backends use their own
-authentication, so the wizard does not ask for an API key or modify `.env`, the
-private key file, or the OpenCode configuration.
+When you select `auto`, `codex-cli`, or `claude-cli`, the wizard updates
+`backend` in the active FM-Agent TOML file and removes non-secret legacy LLM
+overrides from the project `.env`. This prevents an old
+`FM_AGENT_MODEL_BACKEND=opencode` (including `export` form) from taking
+precedence over the selected local backend. These local CLI backends use their
+own authentication, so the wizard does not ask for an API key or modify the
+private key file or OpenCode configuration.
 
 ## Change one setting without rerunning the wizard
 
 Use the same script's `set` command to update only the non-secret `[llm]`
 setting(s) named on the command line. It previews the change, asks for
-confirmation, backs up `fm-agent.toml`, and writes it atomically. It does not
-change `.env`, the API key file, or the standalone OpenCode configuration.
+confirmation, backs up the active FM-Agent TOML file, and writes it atomically.
+It does not change `.env`, the API key file, or the standalone OpenCode
+configuration. If a legacy `.env` value would still override one of the
+requested settings, it warns before writing; remove that line or use the
+interactive wizard to migrate the legacy overrides.
 
 For example, switch FM-Agent to a local Codex CLI backend without touching the
 provider setup:
@@ -80,6 +86,11 @@ If `OPENCODE_CONFIG` is set, the wizard uses that config file path instead of
 the default global location, but the secret file still stays outside the
 worktree.
 
+If `FM_AGENT_CONFIG` is set in the launching shell or project `.env`, both the
+wizard and the `set` command update that TOML path, using the same path
+semantics as `config.py`; otherwise they update the repository's
+`fm-agent.toml`.
+
 `fm-agent.toml` (committed, non-secret):
 
 ```toml
@@ -102,6 +113,15 @@ LLM_API_KEY=your-api-key                      # auth token for FM-Agent's direct
 > non-secret setting still in your `.env` (e.g. `LLM_MODEL`) silently wins and
 > editing the toml has no effect. Move those lines out of `.env`, keeping only
 > `LLM_API_KEY`, so `fm-agent.toml` is the effective source.
+
+The wizard warns when one of the LLM variables is exported in the shell that
+launches it. A live shell variable has higher precedence than both `.env` and
+the TOML file and cannot be changed by a child process. Before starting
+FM-Agent in that shell, follow the displayed command, for example:
+
+```bash
+unset LLM_MODEL FM_AGENT_MODEL_BACKEND
+```
 
 It calls the model two ways:
 

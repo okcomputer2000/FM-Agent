@@ -90,12 +90,15 @@ The easiest setup path is the interactive wizard:
 uv run python src/configure_llm.py
 ```
 
-It previews the changes, backs up existing files, updates `fm-agent.toml`, stores
+It previews the changes, backs up existing files, updates the active FM-Agent
+TOML file, stores
 the API key in `.env` plus a private local key file for standalone OpenCode, and syncs the matching OpenCode provider entry in
 `~/.config/opencode/opencode.json` (or the platform-equivalent config path)
 without requiring you to hand-edit JSON.
-If you choose `auto`, `codex-cli`, or `claude-cli` in the wizard, it only updates
-the backend in `fm-agent.toml`; no API key or OpenCode provider setup is needed.
+If you choose `auto`, `codex-cli`, or `claude-cli` in the wizard, it updates the
+backend in the active FM-Agent TOML file and clears stale non-secret LLM
+overrides from the project `.env`; no API key or OpenCode provider setup is
+needed.
 
 If you prefer to edit files manually, put your API key in `.env` (gitignored,
 loaded automatically via python-dotenv); every other setting has a committed
@@ -119,7 +122,9 @@ shell. Precedence is `env > .env > fm-agent.toml`; because `.env` wins over the
 toml, a stale value there overrides a later toml edit, so check `.env` first if
 a change isn't taking effect. The wizard removes the common legacy LLM override
 keys from `.env` for you. See [docs/config_llm.md](docs/config_llm.md) for
-details and OpenCode provider setup.
+details and OpenCode provider setup. The wizard also warns about LLM variables
+already exported by the launching shell; use its displayed `unset` command
+before starting FM-Agent if the saved configuration should take effect.
 
 To change just one non-secret LLM setting without manually editing the file,
 use the configuration command. For example, select the local Codex CLI backend:
@@ -131,7 +136,8 @@ uv run python src/configure_llm.py set --backend codex-cli
 It previews and backs up `fm-agent.toml`, then changes only the setting(s) you
 pass. The command also supports `--name`, `--provider`, `--base-url`,
 `--effort`, and `--api-style`; see [docs/config_llm.md](docs/config_llm.md) for
-the complete syntax.
+the complete syntax. It warns when a legacy `.env` value would still override a
+requested TOML setting.
 
 Then, all of the above dependencies (except Ubuntu and Python) can be installed via the provided script:
 

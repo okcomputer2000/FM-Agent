@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
 
+from dotenv import dotenv_values
+
 try:
     import tomllib  # type: ignore[attr-defined]
 except ModuleNotFoundError:  # pragma: no cover - exercised only on Python < 3.11
@@ -33,9 +35,11 @@ ENV_LEGACY_LLM_KEYS = (
     "LLM_API_BASE_URL",
     "LLM_MODEL",
     "FM_AGENT_MODEL_BACKEND",
+    "LLM_EFFORT",
     "OPENCODE_MODEL_PROVIDER",
     "LLM_API_STYLE",
 )
+_LLM_ENV_KEYS = (ENV_SECRET_KEY, *ENV_LEGACY_LLM_KEYS)
 
 
 class ConfigWizardError(RuntimeError):
@@ -46,6 +50,14 @@ ApiStyle = Literal["openai", "anthropic"]
 _BACKENDS = ("opencode", "auto", "codex-cli", "claude-cli")
 _EFFORTS = ("", "low", "medium", "high")
 _LLM_TOML_KEYS = ("name", "provider", "base_url", "backend", "effort", "api_style")
+_TOML_KEY_BY_ENV_KEY = {
+    "LLM_API_BASE_URL": "base_url",
+    "LLM_MODEL": "name",
+    "FM_AGENT_MODEL_BACKEND": "backend",
+    "LLM_EFFORT": "effort",
+    "OPENCODE_MODEL_PROVIDER": "provider",
+    "LLM_API_STYLE": "api_style",
+}
 
 
 @dataclass(frozen=True)
@@ -145,9 +157,18 @@ def default_paths(project_root: Path) -> WizardPaths:
     return WizardPaths(
         project_root=project_root,
         env_path=project_root / ".env",
-        toml_path=project_root / "fm-agent.toml",
+        toml_path=_fm_agent_config_path(project_root),
         opencode_config_path=detect_opencode_config_path(),
     )
+
+
+def _fm_agent_config_path(project_root: Path) -> Path:
+    """Match config.py's FM_AGENT_CONFIG path selection exactly."""
+    explicit_config = os.environ.get("FM_AGENT_CONFIG")
+    if explicit_config is None:
+        # config.py loads the project .env without replacing a real process value.
+        explicit_config = dotenv_values(project_root / ".env").get("FM_AGENT_CONFIG")
+    return Path(explicit_config) if explicit_config else project_root / "fm-agent.toml"
 
 
 def mask_secret(secret: str) -> str:
@@ -475,6 +496,66 @@ def update_env_text(text: str, api_key: str) -> str:
     return "".join(new_lines)
 
 
+def remove_legacy_llm_env_overrides(text: str) -> tuple[str, tuple[str, ...]]:
+    """Remove non-secret LLM settings from dotenv text, including ``export`` lines."""
+    new_lines: list[str] = []
+    removed: list[str] = []
+    for line in text.splitlines(keepends=True):
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#"):
+            new_lines.append(line)
+            continue
+
+        export_match = _ENV_EXPORT_PREFIX_RE.match(stripped)
+        working = stripped[export_match.end() :] if export_match else stripped
+        key, sep, _value = working.partition("=")
+        env_key = key.strip() if sep else ""
+        if env_key in ENV_LEGACY_LLM_KEYS:
+            if env_key not in removed:
+                removed.append(env_key)
+            continue
+        new_lines.append(line)
+    return "".join(new_lines), tuple(removed)
+
+
+def live_llm_environment_overrides() -> tuple[str, ...]:
+    """Return real process overrides; the wizard must not alter its caller's shell."""
+    return tuple(name for name in _LLM_ENV_KEYS if name in os.environ)
+
+
+def warn_live_llm_environment_overrides() -> None:
+    overrides = live_llm_environment_overrides()
+    if not overrides:
+        return
+    print("Warning: these shell environment variables override the saved LLM settings:")
+    print(f"  {', '.join(overrides)}")
+    print("The wizard cannot change the shell that launched it. Before starting FM-Agent")
+    print("in this shell, unset them to use the saved configuration:")
+    print(f"  unset {' '.join(overrides)}")
+
+
+def warn_dotenv_overrides_for_updates(
+    env_path: Path,
+    updates: dict[str, str],
+) -> bool:
+    """Warn when the focused TOML update remains shadowed by project dotenv."""
+    _updated_env, legacy_overrides = remove_legacy_llm_env_overrides(
+        _read_text_if_exists(env_path)
+    )
+    shadowing = tuple(
+        name
+        for name in legacy_overrides
+        if _TOML_KEY_BY_ENV_KEY[name] in updates
+    )
+    if not shadowing:
+        return False
+    print("Warning: these project .env variables still override this TOML update:")
+    print(f"  {', '.join(shadowing)}")
+    print("The set command does not modify .env. Remove those lines, or run the")
+    print("interactive wizard to migrate legacy LLM overrides.")
+    return True
+
+
 def validate_generated_state(
     config: LLMConfigInput,
     merged_opencode: dict,
@@ -778,7 +859,7 @@ def run_wizard(project_root: Path) -> int:
             "Local CLI backends use their own authentication; no API key or OpenCode "
             "provider configuration is required."
         )
-        return run_llm_settings_update(project_root, {"backend": backend})
+        return run_local_backend_configuration(project_root, backend)
 
     paths = default_paths(project_root)
     print()
@@ -786,6 +867,9 @@ def run_wizard(project_root: Path) -> int:
     print()
     print(_preview(config, paths))
     print()
+    warn_live_llm_environment_overrides()
+    if live_llm_environment_overrides():
+        print()
     if not _prompt_yes_no("Continue?", default=True):
         print("Aborted.")
         return 1
@@ -799,6 +883,97 @@ def run_wizard(project_root: Path) -> int:
             print(f"✓ Backed up {path} -> {backup}")
     if validate:
         print("✓ Configuration syntax is valid")
+    return 0
+
+
+def _preview_local_backend_configuration(
+    backend: str,
+    paths: WizardPaths,
+    removed_overrides: tuple[str, ...],
+) -> str:
+    lines = [
+        "FM-Agent local CLI backend configuration",
+        "",
+        f"Backend: {backend}",
+        "",
+        "The following files will be updated:",
+        f"  - {paths.toml_path}",
+    ]
+    if removed_overrides:
+        lines.extend(
+            [
+                f"  - {paths.env_path}",
+                "",
+                "The following legacy dotenv overrides will be removed so they do not",
+                f"shadow the selected backend: {', '.join(removed_overrides)}",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "",
+                "No legacy LLM overrides were found in the project .env file.",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "No API key or OpenCode provider configuration will be changed.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def apply_local_backend_configuration(
+    backend: str,
+    paths: WizardPaths,
+) -> tuple[list[tuple[Path, Path | None]], tuple[str, ...]]:
+    validate_llm_setting("backend", backend)
+    toml_text = _read_text_if_exists(paths.toml_path)
+    if not toml_text:
+        raise ConfigWizardError(
+            f"fm-agent.toml not found at {paths.toml_path}; refusing to guess a new project config."
+        )
+    updated_toml = update_llm_settings_toml_text(toml_text, {"backend": backend})
+    try:
+        tomllib.loads(updated_toml)
+    except tomllib.TOMLDecodeError as exc:  # Defensive: the text editor should preserve TOML.
+        raise ConfigWizardError("Generated fm-agent.toml is invalid TOML.") from exc
+
+    updated_env, removed_overrides = remove_legacy_llm_env_overrides(
+        _read_text_if_exists(paths.env_path)
+    )
+    backups = [(paths.toml_path, backup_file(paths.toml_path))]
+    if removed_overrides:
+        backups.append((paths.env_path, backup_file(paths.env_path, private=True)))
+
+    atomic_write(paths.toml_path, updated_toml)
+    if removed_overrides:
+        atomic_write(paths.env_path, updated_env)
+    return backups, removed_overrides
+
+
+def run_local_backend_configuration(project_root: Path, backend: str) -> int:
+    paths = default_paths(project_root)
+    _updated_env, removed_overrides = remove_legacy_llm_env_overrides(
+        _read_text_if_exists(paths.env_path)
+    )
+    print(_preview_local_backend_configuration(backend, paths, removed_overrides))
+    print()
+    warn_live_llm_environment_overrides()
+    if live_llm_environment_overrides():
+        print()
+    if not _prompt_yes_no("Continue?", default=True):
+        print("Aborted.")
+        return 1
+
+    backups, removed_overrides = apply_local_backend_configuration(backend, paths)
+    print(f"Updated {paths.toml_path}")
+    if removed_overrides:
+        print(f"Removed legacy LLM overrides from {paths.env_path}")
+    for path, backup in backups:
+        if backup is not None:
+            print(f"Backed up {path} -> {backup}")
     return 0
 
 
@@ -852,9 +1027,14 @@ def run_llm_settings_update(
     *,
     assume_yes: bool = False,
 ) -> int:
-    toml_path = project_root / "fm-agent.toml"
+    paths = default_paths(project_root)
+    toml_path = paths.toml_path
     print(_preview_llm_settings_update(updates, toml_path))
     print()
+    has_dotenv_override = warn_dotenv_overrides_for_updates(paths.env_path, updates)
+    warn_live_llm_environment_overrides()
+    if has_dotenv_override or live_llm_environment_overrides():
+        print()
     if not assume_yes and not _prompt_yes_no("Continue?", default=True):
         print("Aborted.")
         return 1
