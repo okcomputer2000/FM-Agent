@@ -219,13 +219,13 @@ def _rust_edges_from_lsif(text: str, root: Path, extractor):
             if isinstance(range_ids, (list, tuple)):
                 for range_id in range_ids:
                     range_files[str(range_id)] = documents.get(str(edge.get("outV")))
-        elif label == "item" and edge.get("property") in {"definitions", "references"}:
+        elif label == "item" and edge.get("property") in {None, "definitions", "references"}:
             range_ids = edge.get("inVs", [])
             if not isinstance(range_ids, (list, tuple)):
                 continue
             target = (
                 definition_items
-                if edge.get("property") == "definitions"
+                if edge.get("property") in {None, "definitions"}
                 else reference_items
             )
             target[str(edge.get("outV"))].update(str(value) for value in range_ids)
