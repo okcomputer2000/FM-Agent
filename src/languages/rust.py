@@ -163,6 +163,59 @@ def _rust_utf16_index(text: str, units: int) -> int:
     return len(text)
 
 
+def _rust_turbofish_is_call(suffix: str) -> bool:
+    """Require a call delimiter immediately after balanced generic arguments."""
+    stripped = suffix.lstrip()
+    if stripped.startswith("::<"):
+        generic_start = 2
+    elif stripped.startswith("<"):
+        generic_start = 0
+    else:
+        return False
+
+    angle_depth = 0
+    delimiters = []
+    matching = {")": "(", "]": "[", "}": "{"}
+    quote = None
+    escaped = False
+    index = generic_start
+    while index < len(stripped):
+        character = stripped[index]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            index += 1
+            continue
+        if character == '"':
+            quote = character
+        elif character == "'" and index + 2 < len(stripped):
+            if stripped[index + 1] == "\\":
+                char_end = index + 3
+            else:
+                char_end = index + 2
+            if char_end < len(stripped) and stripped[char_end] == "'":
+                quote = character
+        elif character in "([{":
+            delimiters.append(character)
+        elif character in ")]}":
+            if delimiters and matching[character] == delimiters[-1]:
+                delimiters.pop()
+        elif not delimiters and character == "<":
+            angle_depth += 1
+        elif not delimiters and character == ">":
+            angle_depth -= 1
+            if angle_depth == 0:
+                return stripped[index + 1 :].lstrip().startswith("(")
+            if angle_depth < 0:
+                return False
+        index += 1
+    return False
+
+
 def _rust_is_call(source_lines, range_node) -> bool:
     """Check that an LSIF reference token is used as a call, not a value."""
     if not isinstance(range_node, dict):
@@ -178,8 +231,7 @@ def _rust_is_call(source_lines, range_node) -> bool:
     suffix = source_lines[line][_rust_utf16_index(source_lines[line], column):]
     if suffix.lstrip().startswith("("):
         return True
-    stripped = suffix.lstrip()
-    return (stripped.startswith("<") or stripped.startswith("::<")) and "(" in stripped
+    return _rust_turbofish_is_call(suffix)
 
 
 def _rust_analyzer_cache_key(root: Path, extractor):
