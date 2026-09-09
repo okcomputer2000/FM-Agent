@@ -206,7 +206,11 @@ def _rust_turbofish_is_call(suffix: str) -> bool:
                 delimiters.pop()
         elif not delimiters and character == "<":
             angle_depth += 1
-        elif not delimiters and character == ">":
+        elif (
+            not delimiters
+            and character == ">"
+            and (index == 0 or stripped[index - 1] != "-")
+        ):
             angle_depth -= 1
             if angle_depth == 0:
                 return stripped[index + 1 :].lstrip().startswith("(")
