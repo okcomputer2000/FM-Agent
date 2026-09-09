@@ -12,6 +12,9 @@ from urllib.parse import unquote, urlparse
 from src.languages.codegraph import CodeGraphExtractor, _node_fqn_map
 
 
+_RUST_ANALYZER_CACHE = {}
+
+
 def _rust_analyzer_command() -> list[str] | None:
     """Return the configured rust-analyzer command when it is available."""
     configured = os.environ.get("RUST_ANALYZER_COMMAND", "rust-analyzer").strip()
@@ -175,7 +178,17 @@ def _rust_is_call(source_lines, range_node) -> bool:
     suffix = source_lines[line][_rust_utf16_index(source_lines[line], column):]
     if suffix.lstrip().startswith("("):
         return True
-    return suffix.lstrip().startswith("<") and "(" in suffix
+    stripped = suffix.lstrip()
+    return (stripped.startswith("<") or stripped.startswith("::<")) and "(" in stripped
+
+
+def _rust_analyzer_cache_key(root: Path, extractor):
+    """Return a stable key that changes when the indexed project changes."""
+    try:
+        stat = os.stat(extractor._db)
+        return (str(root), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return None
 
 
 def _rust_edges_from_lsif(text: str, root: Path, extractor):
@@ -426,11 +439,25 @@ def call_edges(proj_dir: str) -> dict:
     if cg is None:
         return None
     root = Path(cg._db).resolve().parent.parent
-    semantic_text = _run_rust_analyzer_lsif(root)
-    if semantic_text is not None:
-        semantic_edges = _rust_edges_from_lsif(semantic_text, root, cg)
-        if semantic_edges is not None:
-            return semantic_edges
+    cache_key = _rust_analyzer_cache_key(root, cg)
+    if cache_key is not None and cache_key in _RUST_ANALYZER_CACHE:
+        cached = _RUST_ANALYZER_CACHE[cache_key]
+    elif cache_key is not None:
+        semantic_text = _run_rust_analyzer_lsif(root)
+        semantic_edges = (
+            _rust_edges_from_lsif(semantic_text, root, cg)
+            if semantic_text is not None
+            else None
+        )
+        for old_key in list(_RUST_ANALYZER_CACHE):
+            if old_key[0] == cache_key[0] and old_key != cache_key:
+                del _RUST_ANALYZER_CACHE[old_key]
+        _RUST_ANALYZER_CACHE[cache_key] = semantic_edges
+        cached = semantic_edges
+    else:
+        cached = None
+    if cached is not None:
+        return cached
     return cg.get_call_edges("rust")
 
 
